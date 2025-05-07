@@ -10,7 +10,9 @@
 *   **OpenAI API**: 呼叫 OpenAI 的 Embedding API (例如 `text-embedding-3-small`, `text-embedding-ada-002`)
 *   **Google Gemini API**: 呼叫 Google Generative AI 的 Embedding API (例如 `models/embedding-001`)
 *   **Ollama**: 透過 Ollama 服務呼叫本地運行的 Embedding 模型 (例如 `ollama/nomic-embed-text`)
-*   **本地 Hugging Face 模型**: 使用 `sentence-transformers` 函式庫動態載入 Hugging Face Hub 上的任何相容模型
+*   **Hugging Face 模型**: 使用 `sentence-transformers` 函式庫動態載入 Hugging Face Hub 上的任何相容模型，支援兩種調用方式：
+    - 明確前綴: `huggingface/bge-large-zh-v1.5`
+    - 直接模型名稱: `sentence-transformers/all-MiniLM-L6-v2` (向後兼容)
 
 ### 1.2 Chat Completion 功能
 
@@ -18,9 +20,10 @@
 *   **OpenAI API**: 支援 GPT 模型 (例如 `openai/gpt-4`, `openai/gpt-3.5-turbo`)
 *   **Anthropic Claude**: 支援 Claude 模型 (例如 `claude/claude-3-haiku-20240307`, `claude/claude-3-sonnet-20240229`)
 *   **Google Gemini**: 支援 Gemini 模型 (例如 `gemini/gemini-1.5-pro`, `gemini/gemini-1.0-pro`)
-*   **DeepSeek**: 支援 DeepSeek 聊天模型 (例如 `deepseek/deepseek-chat`)
-*   **MinMax**: 支援 MinMax 聊天模型 (例如 `minmax/abab6-chat`)
-*   **Ollama**: 支援本地部署的開源模型 (例如 `ollama/llama3`, `ollama/qwen:7b`)
+*   **DeepSeek**: 支援 DeepSeek 模型 (例如 `deepseek/deepseek-chat`)
+*   **MinMax**: 支援 MinMax 模型 (例如 `minmax/abab6-chat`)
+*   **Ollama**: 支援本地 Ollama 模型 (例如 `ollama/llama3`, `ollama/mistral`)
+*   **Hugging Face**: 支援 Hugging Face 上的開源大型語言模型 (例如 `huggingface/meta-llama/Llama-3-8b-chat`, `huggingface/mistralai/Mistral-7B-Instruct-v0.2`)
 
 ### 1.3 特殊功能
 
@@ -89,7 +92,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 ## 3. CURL 使用範例
 
-### 3.1 Embedding 使用範例
+### 3.1.1 Embedding 使用範例
 
 **OpenAI Embedding**:
 ```bash
@@ -126,12 +129,12 @@ curl -X POST "http://localhost:8000/v1/embeddings" \
 curl -X POST "http://localhost:8000/v1/embeddings" \
      -H "Content-Type: application/json" \
      -d '{
-       "model": "all-MiniLM-L6-v2",
+       "model": "huggingface/bge-large-zh-v1.5",
        "input": "這是一段需要嵌入的文本。"
      }'
 ```
 
-### 3.2 Chat Completion 使用範例
+### 3.1.2 Chat Completion 使用範例
 
 **OpenAI GPT (非串流)**:
 ```bash
@@ -232,6 +235,35 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
      }'
 ```
 
+**Hugging Face (非串流)**:
+```bash
+curl -X POST "http://localhost:8000/v1/chat/completions" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "model": "huggingface/meta-llama/Llama-3-8b-chat",
+       "messages": [
+         {"role": "system", "content": "你是一個有用的助手。"},
+         {"role": "user", "content": "請介紹臺灣的夜市文化。"}
+       ],
+       "temperature": 0.7
+     }'
+```
+
+**Hugging Face (串流)**:
+```bash
+curl -X POST "http://localhost:8000/v1/chat/completions" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "model": "huggingface/meta-llama/Llama-3-8b-chat",
+       "messages": [
+         {"role": "system", "content": "你是一個有用的助手。"},
+         {"role": "user", "content": "請介紹臺灣的夜市文化。"}
+       ],
+       "temperature": 0.7,
+       "stream": true
+     }'
+```
+
 ## 4. Python 使用範例
 
 ### 4.1 Embedding 使用範例
@@ -249,7 +281,7 @@ headers = {"Content-Type": "application/json"}
 model_name = "text-embedding-3-small"       # OpenAI
 # model_name = "models/embedding-001"       # Google Gemini
 # model_name = "ollama/nomic-embed-text"    # Ollama
-# model_name = "all-MiniLM-L6-v2"           # Hugging Face
+# model_name = "huggingface/bge-large-zh-v1.5"  # Hugging Face
 
 # 準備請求數據
 data = {
@@ -301,6 +333,7 @@ model_name = "openai/gpt-3.5-turbo"         # OpenAI
 # model_name = "deepseek/deepseek-chat"     # DeepSeek
 # model_name = "minmax/abab6-chat"          # MinMax
 # model_name = "ollama/llama3"              # Ollama
+# model_name = "huggingface/meta-llama/Llama-3-8b-chat"  # Hugging Face
 
 # 準備請求數據
 data = {
@@ -364,6 +397,7 @@ model_name = "openai/gpt-3.5-turbo"         # OpenAI
 # model_name = "deepseek/deepseek-chat"     # DeepSeek
 # model_name = "minmax/abab6-chat"          # MinMax
 # model_name = "ollama/llama3"              # Ollama
+# model_name = "huggingface/meta-llama/Llama-3-8b-chat"  # Hugging Face
 
 # 準備請求數據 (注意啟用串流)
 data = {
@@ -409,7 +443,33 @@ except requests.exceptions.RequestException as e:
             print(f"錯誤內容: {e.response.text}")
 ```
 
-## 5. 串流功能說明
+## 5. Hugging Face 模型使用指南
+
+### 5.1 支援的模型類型
+
+對於 Embedding 功能，服務支援:
+- 所有兼容 sentence-transformers 的模型
+- 常用模型包括: `bge-large-zh-v1.5`, `all-MiniLM-L6-v2`, `paraphrase-multilingual-MiniLM-L12-v2` 等
+
+對於 Chat Completion 功能，服務支援:
+- 可進行因果語言建模 (Causal Language Modeling) 的模型
+- 常用聊天模型包括: `meta-llama/Llama-3-8b-chat`, `mistralai/Mistral-7B-Instruct-v0.2`, `google/gemma-7b-it` 等
+
+### 5.2 本地資源需求
+
+使用 Hugging Face 的聊天模型需要考慮:
+- GPU 記憶體: 較大的模型 (例如 Llama-3-70b) 需要大量 GPU 記憶體
+- 下載時間: 首次使用時需要從 Hugging Face Hub 下載模型權重
+- 磁碟空間: 模型權重會暫時儲存於本機
+
+### 5.3 使用建議
+
+- 首次使用時，調用過程可能較慢，因為需要下載模型權重
+- 對於大型模型，可以使用 `device_map="auto"` 參數進行模型分割
+- 設定適當的 max_tokens 以控制生成長度和資源使用
+- 在生產環境中，考慮使用專用 GPU 伺服器
+
+## 6. 串流功能說明
 
 所有聊天模型均支援串流輸出 (Streaming)，適合需要即時顯示回應的場景。啟用方法為在請求中設定 `"stream": true`。
 
@@ -420,7 +480,7 @@ data: {"choices": [{"delta": {"content": "更多回應內容"}}]}
 data: [DONE]
 ```
 
-## 6. 注意事項
+## 7. 注意事項
 
 * **API 金鑰安全**: 使用環境變數或 `.env` 檔案管理 API 金鑰，避免直接寫入程式碼
 * **錯誤處理**: 各服務可能回傳不同的錯誤格式，建議實作穩健的錯誤處理機制

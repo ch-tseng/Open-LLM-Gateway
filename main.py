@@ -376,10 +376,39 @@ async def create_embedding(request: EmbeddingRequest):
                 raise HTTPException(status_code=500, detail=f"處理 Ollama embedding '{ollama_model_name}' 時發生錯誤: {str(e)}")
 
         # --- Hugging Face 本地模型 ---
-        else:
-            # 假設其他所有模型名稱都是 Hugging Face 模型
+        elif requested_model.startswith("huggingface/"):
+            # 使用明確的 'huggingface/' 前綴來標識 Hugging Face 模型
+            # 例如: 'huggingface/sentence-transformers/all-MiniLM-L6-v2'
+            # 或是: 'huggingface/bge-large-zh-v1.5'
+            
             try:
-                print(f"嘗試使用 Hugging Face 模型: {requested_model}")
+                # 移除 'huggingface/' 前綴以獲取實際模型名稱
+                hf_model_name = requested_model.replace('huggingface/', '', 1)
+                print(f"使用 Hugging Face 模型: {hf_model_name}")
+                
+                hf_model = get_hf_model(hf_model_name) # 可能拋出 HTTPException
+                embeddings = hf_model.encode(input_texts, convert_to_list=True)
+
+                for i, emb in enumerate(embeddings):
+                    response_data.append(EmbeddingData(embedding=emb, index=i))
+
+                # 計算 token
+                tokens = count_tokens(input_texts)
+                usage = Usage(prompt_tokens=tokens, total_tokens=tokens)
+                actual_model_name = requested_model
+
+            except HTTPException as e: # 重新拋出 get_hf_model 或其他地方的 HTTP 錯誤
+                raise e
+            except Exception as e:
+                print(f"處理 Hugging Face embedding 時發生錯誤 ({hf_model_name}): {e}")
+                # 可以判斷是否為模型不存在等特定錯誤
+                raise HTTPException(status_code=500, detail=f"處理 Hugging Face embedding '{hf_model_name}' 時發生錯誤: {str(e)}")
+
+        # --- 其他模型 (向後兼容性) ---
+        else:
+            # 假設其他所有模型名稱也都是 Hugging Face 模型 (向後兼容)
+            try:
+                print(f"嘗試使用未指定前綴的模型: {requested_model}，假設為 Hugging Face 模型")
                 hf_model = get_hf_model(requested_model) # 可能拋出 HTTPException
                 embeddings = hf_model.encode(input_texts, convert_to_list=True)
 
@@ -394,7 +423,7 @@ async def create_embedding(request: EmbeddingRequest):
             except HTTPException as e: # 重新拋出 get_hf_model 或其他地方的 HTTP 錯誤
                 raise e
             except Exception as e:
-                print(f"處理 Hugging Face embedding 時發生錯誤 ({requested_model}): {e}")
+                print(f"處理本地 embedding 時發生錯誤 ({requested_model}): {e}")
                 # 可以判斷是否為模型不存在等特定錯誤
                 raise HTTPException(status_code=500, detail=f"處理本地 embedding '{requested_model}' 時發生錯誤: {str(e)}")
 
@@ -1110,6 +1139,20 @@ async def create_chat_completion(request: ChatCompletionRequest):
             else:
                 print("Routing to get_chat_completion_claude") # DEBUG LOG
                 return await get_chat_completion_claude(request)
+        elif request.model.startswith("huggingface/"):
+            if request.stream:
+                print("Routing to stream_chat_completion_huggingface") # DEBUG LOG
+                return await stream_chat_completion_huggingface(request)
+            else:
+                print("Routing to get_chat_completion_huggingface") # DEBUG LOG
+                return await get_chat_completion_huggingface(request)
+        elif request.model.startswith("deepseek/"):
+            if request.stream:
+                print("Routing to stream_chat_completion_openai for DeepSeek") # stream_chat_completion_openai 內部處理 deepseek 串流
+                return await stream_chat_completion_openai(request)
+            else:
+                print("Routing to get_chat_completion_deepseek") # 需要實現此函數
+                return await get_chat_completion_deepseek(request) # 非串流 DeepSeek 處理函數
         else:
             raise HTTPException(
                 status_code=400,
@@ -1527,3 +1570,288 @@ async def get_chat_completion_claude(request: ChatCompletionRequest) -> ChatComp
              raise HTTPException(status_code=404, detail=f"Anthropic 模型 '{model_name}' 未找到: {str(e)}")
         # Add more specific error handling as needed
         raise HTTPException(status_code=500, detail=error_message) 
+
+async def get_chat_completion_huggingface(request: ChatCompletionRequest) -> ChatCompletionResponse:
+    """處理 Hugging Face 的非串流聊天完成請求"""
+    try:
+        # 移除 'huggingface/' 前綴
+        model_name = request.model.replace('huggingface/', '', 1)
+        print(f"使用 Hugging Face 聊天模型: {model_name}")
+        
+        # 嘗試導入必要的庫
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+            import torch
+        except ImportError:
+            print("錯誤: transformers 或 torch 庫未安裝。請執行 pip install transformers torch")
+            raise HTTPException(status_code=500, detail="伺服器錯誤：缺少 transformers 或 torch 庫")
+        
+        # 加載模型與分詞器
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto")
+            print(f"已成功加載 Hugging Face 模型: {model_name}")
+        except Exception as e:
+            print(f"加載 Hugging Face 模型 {model_name} 失敗: {e}")
+            raise HTTPException(status_code=500, detail=f"加載 Hugging Face 模型 {model_name} 失敗: {str(e)}")
+        
+        # 構建提示文本
+        system_content = None
+        prompt = ""
+        
+        # 處理系統提示與訊息
+        for msg in request.messages:
+            if msg.role == "system":
+                system_content = msg.content
+            elif msg.role == "user":
+                prompt += f"User: {msg.content}\n"
+            elif msg.role == "assistant":
+                prompt += f"Assistant: {msg.content}\n"
+        
+        # 如果有系統提示，加到前面
+        if system_content:
+            prompt = f"System: {system_content}\n" + prompt
+        
+        # 加入最後的助手標記，表示助手即將回應
+        prompt += "Assistant: "
+        
+        # 準備輸入
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        
+        # 生成回應
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=request.max_tokens if request.max_tokens else 1024,
+                temperature=request.temperature if request.temperature else 0.7,
+                do_sample=True if request.temperature and request.temperature > 0 else False,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        # 解碼回應並處理
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # 提取助手的回應部分
+        assistant_response = generated_text[len(prompt):]
+        
+        # 提取輸入與輸出 token 數量
+        input_tokens = len(inputs.input_ids[0])
+        output_tokens = len(outputs[0]) - input_tokens
+        total_tokens = input_tokens + output_tokens
+        
+        return ChatCompletionResponse(
+            id=f"huggingface-{int(time.time())}",
+            created=int(time.time()),
+            model=request.model,
+            choices=[{
+                "message": {
+                    "role": "assistant",
+                    "content": assistant_response
+                },
+                "finish_reason": "stop"
+            }],
+            usage={
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": total_tokens
+            }
+        )
+    except Exception as e:
+        print(f"Hugging Face Chat Completion 錯誤: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Hugging Face Chat Completion 錯誤: {str(e)}")
+
+async def stream_chat_completion_huggingface(request: ChatCompletionRequest):
+    """處理 Hugging Face 的串流聊天完成請求"""
+    try:
+        # 移除 'huggingface/' 前綴
+        model_name = request.model.replace('huggingface/', '', 1)
+        print(f"使用 Hugging Face 串流聊天模型: {model_name}")
+        
+        # 嘗試導入必要的庫
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+            import torch
+            from threading import Thread
+        except ImportError:
+            print("錯誤: transformers 或 torch 庫未安裝。請執行 pip install transformers torch")
+            raise HTTPException(status_code=500, detail="伺服器錯誤：缺少 transformers 或 torch 庫")
+        
+        # 加載模型與分詞器
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto")
+            print(f"已成功加載 Hugging Face 模型: {model_name}")
+        except Exception as e:
+            print(f"加載 Hugging Face 模型 {model_name} 失敗: {e}")
+            raise HTTPException(status_code=500, detail=f"加載 Hugging Face 模型 {model_name} 失敗: {str(e)}")
+        
+        # 構建提示文本
+        system_content = None
+        prompt = ""
+        
+        # 處理系統提示與訊息
+        for msg in request.messages:
+            if msg.role == "system":
+                system_content = msg.content
+            elif msg.role == "user":
+                prompt += f"User: {msg.content}\n"
+            elif msg.role == "assistant":
+                prompt += f"Assistant: {msg.content}\n"
+        
+        # 如果有系統提示，加到前面
+        if system_content:
+            prompt = f"System: {system_content}\n" + prompt
+        
+        # 加入最後的助手標記，表示助手即將回應
+        prompt += "Assistant: "
+        
+        # 準備輸入
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        
+        # 設置串流器
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, timeout=OLLAMA_TIMEOUT)
+        
+        # 設置生成參數
+        gen_kwargs = dict(
+            **inputs,
+            max_new_tokens=request.max_tokens if request.max_tokens else 1024,
+            temperature=request.temperature if request.temperature else 0.7,
+            do_sample=True if request.temperature and request.temperature > 0 else False,
+            streamer=streamer,
+            pad_token_id=tokenizer.eos_token_id
+        )
+        
+        # 在後台線程中執行生成
+        thread = Thread(target=lambda: model.generate(**gen_kwargs))
+        thread.start()
+        
+        # 返回串流回應
+        async def generate():
+            previous_text = ""
+            
+            try:
+                # 讀取並發送增量文本
+                for new_text in streamer:
+                    if new_text:
+                        incremental_text = new_text
+                        previous_text += incremental_text
+                        
+                        # 構建回應分塊
+                        response_data = {
+                            'choices': [{
+                                'delta': {
+                                    'content': incremental_text
+                                }
+                            }]
+                        }
+                        
+                        yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                        
+                # 最後發送完成標記
+                yield "data: [DONE]\n\n"
+                
+            except Exception as e:
+                error_msg = f"Hugging Face 串流處理錯誤: {str(e)}"
+                print(error_msg)
+                # 可能的錯誤處理
+                yield f"data: {json.dumps({'error': error_msg}, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+        
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Content-Type": "text/event-stream; charset=utf-8"}
+        )
+    except Exception as e:
+        print(f"Hugging Face 串流 Chat Completion 錯誤: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Hugging Face 串流 Chat Completion 錯誤: {str(e)}")
+
+async def get_chat_completion_deepseek(request: ChatCompletionRequest) -> ChatCompletionResponse:
+    """處理 DeepSeek 的非串流聊天完成請求"""
+    if not DEEPSEEK_API_KEY:
+        raise HTTPException(status_code=500, detail="未設定 DeepSeek API 金鑰 (DEEPSEEK_API_KEY)")
+    if not DEEPSEEK_API_ENDPOINT_NONSTREAM:
+        raise HTTPException(status_code=500, detail="未設定 DeepSeek API 非串流端點 (DEEPSEEK_API_ENDPOINT_NONSTREAM)")
+
+    model_name = request.model.replace("deepseek/", "", 1)
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY.strip()}"
+    }
+    
+    payload_data = {
+        "model": model_name,
+        "messages": [{"role": msg.role, "content": msg.content} for msg in request.messages],
+        "temperature": request.temperature,
+        "stream": False
+    }
+    if request.max_tokens is not None:
+        payload_data["max_tokens"] = request.max_tokens
+
+    print(f"DeepSeek non-stream: Sending request to {DEEPSEEK_API_ENDPOINT_NONSTREAM} for model {model_name}")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                DEEPSEEK_API_ENDPOINT_NONSTREAM,
+                headers=headers,
+                json=payload_data,
+                timeout=aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT) 
+            ) as response:
+                response_text = await response.text() # Read text first for logging
+                print(f"DeepSeek non-stream: Response status: {response.status}, Response body: {response_text[:500]}") # Log first 500 chars
+                
+                if response.status != 200:
+                    raise HTTPException(
+                        status_code=response.status,
+                        detail=f"DeepSeek API (non-stream) 回應錯誤: {response_text}"
+                    )
+                
+                result = json.loads(response_text) # Parse from already read text
+                                
+                # Validate DeepSeek non-stream response structure (assuming OpenAI-like)
+                if not result.get("choices") or not isinstance(result["choices"], list) or len(result["choices"]) == 0:
+                    raise HTTPException(status_code=500, detail="DeepSeek API (non-stream) 回應格式錯誤: 缺少或無效的 'choices'")
+                
+                first_choice = result["choices"][0]
+                if not isinstance(first_choice.get("message"), dict) or first_choice["message"].get("content") is None:
+                    raise HTTPException(status_code=500, detail="DeepSeek API (non-stream) 回應格式錯誤: 缺少或無效的 'message.content'")
+
+                # Extract usage details, providing defaults if not present
+                usage_data = result.get("usage", {})
+                prompt_tokens = usage_data.get("prompt_tokens", 0)
+                completion_tokens = usage_data.get("completion_tokens", 0)
+                total_tokens = usage_data.get("total_tokens", prompt_tokens + completion_tokens)
+                if total_tokens == 0 and (prompt_tokens > 0 or completion_tokens > 0) : # Recalculate if total is 0 but others are not
+                    total_tokens = prompt_tokens + completion_tokens
+
+                return ChatCompletionResponse(
+                    id=result.get("id", f"deepseek-nonstream-{int(time.time())}"),
+                    created=result.get("created", int(time.time())),
+                    model=result.get("model", request.model), # Use request.model to keep prefix, or result.get("model") for API returned model
+                    choices=[{
+                        "message": {
+                            "role": first_choice["message"].get("role", "assistant"),
+                            "content": first_choice["message"]["content"]
+                        },
+                        "finish_reason": first_choice.get("finish_reason", "stop")
+                    }],
+                    usage={
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens
+                    }
+                )
+
+    except aiohttp.ClientError as e_client:
+        print(f"DeepSeek API (non-stream) 連線錯誤: {str(e_client)}")
+        raise HTTPException(status_code=503, detail=f"DeepSeek API (non-stream) 連線錯誤: {str(e_client)}")
+    except json.JSONDecodeError as e_json:
+        print(f"DeepSeek API (non-stream) JSON 解析錯誤: {str(e_json)} for response text: {response_text[:500]}")
+        raise HTTPException(status_code=500, detail=f"DeepSeek API (non-stream) JSON 解析錯誤: {str(e_json)}")
+    except Exception as e_general:
+        print(f"DeepSeek API (non-stream) 未知錯誤: {str(e_general)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"DeepSeek API (non-stream) 錯誤: {str(e_general)}")
