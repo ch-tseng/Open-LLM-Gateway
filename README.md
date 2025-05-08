@@ -11,13 +11,13 @@
 *   **Chat Completion**: 提供強大的聊天對話功能，支援串流與非串流模式。
 *   **串流輸出 (Streaming)**: 所有聊天模型供應商均支援串流回應，可即時獲取生成內容。
 
-### 1.2 Embedding 功能支援
+### 1.2 Embedding 功能支援（使用者可自行指定）
 *   **OpenAI API**: 例如 `text-embedding-3-small`, `text-embedding-ada-002`
 *   **Google Gemini API**: 例如 `models/embedding-001`
 *   **Ollama**: 本地運行的 Embedding 模型，例如 `ollama/nomic-embed-text`
 *   **Hugging Face 模型**: 使用 `sentence-transformers` 載入模型，例如 `huggingface/bge-large-zh-v1.5` 或直接使用 `sentence-transformers/all-MiniLM-L6-v2` (向後兼容)
 
-### 1.3 Chat Completion 功能支援
+### 1.3 Chat Completion 功能支援（使用者可自行指定）
 *   **OpenAI API**: 例如 `openai/gpt-4`, `openai/gpt-3.5-turbo`
 *   **Anthropic Claude API**: 例如 `claude/claude-3-opus-20240229`, `claude/claude-3-sonnet-20240229`, `claude/claude-3-haiku-20240307`
 *   **Google Gemini API**: 例如 `gemini/gemini-1.5-pro-latest`, `gemini/gemini-1.0-pro`
