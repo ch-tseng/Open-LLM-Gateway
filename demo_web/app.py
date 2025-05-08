@@ -20,10 +20,12 @@ DEFAULT_MODELS = {
     "gemini": ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash", "gemini-2.5-flash-preview-04-17", "gemini-2.5-pro-preview-05-06", "gemini-1.0-pro"],
     "deepseek": ["deepseek-chat"],
     "minmax": ["minimax-text-01", "abab6.5s-chat"],
-    "ollama": ["qwen3:8b", "gemma3:12b"]
+    "ollama": ["qwen3:8b", "gemma3:12b"],
+    "huggingface": ["meta-llama/Llama-3-8b-chat", "meta-llama/Llama-3-70b-chat", "mistralai/Mistral-7B-Instruct-v0.2", "google/gemma-7b-it", "microsoft/phi-3-medium-4k-instruct"]
 }
 
 DEFAULT_API_ENDPOINT = "http://172.30.11.15:8000"
+API_KEY = "AT0130-20250508-kbxk8c"
 
 # 載入配置 - 簡化為直接使用默認值
 MODELS = DEFAULT_MODELS
@@ -57,6 +59,9 @@ if 'messages' not in st.session_state:
 if 'api_endpoint' not in st.session_state:
     st.session_state.api_endpoint = DEFAULT_ENDPOINT
 
+if 'api_key' not in st.session_state:
+    st.session_state.api_key = API_KEY
+
 if 'selected_vendor' not in st.session_state:
     st.session_state.selected_vendor = "openai"
 
@@ -78,12 +83,23 @@ with st.sidebar:
     if api_endpoint != st.session_state.api_endpoint:
         st.session_state.api_endpoint = api_endpoint
     
+    # API金鑰設定
+    api_key = st.text_input(
+        "API金鑰",
+        value=st.session_state.api_key,
+        type="password"
+    )
+    
+    # 更新API金鑰
+    if api_key != st.session_state.api_key:
+        st.session_state.api_key = api_key
+    
     # LLM供應商選擇
     st.subheader("LLM供應商選擇")
     vendor = st.selectbox(
         "選擇LLM供應商",
-        options=["openai", "claude", "gemini", "deepseek", "minmax", "ollama"],
-        index=["openai", "claude", "gemini", "deepseek", "minmax", "ollama"].index(st.session_state.selected_vendor)
+        options=["openai", "claude", "gemini", "deepseek", "minmax", "ollama", "huggingface"],
+        index=["openai", "claude", "gemini", "deepseek", "minmax", "ollama", "huggingface"].index(st.session_state.selected_vendor)
     )
     
     # 更新供應商選擇
@@ -131,7 +147,10 @@ for message in st.session_state.messages:
 # 函數：發送非串流請求
 def send_non_stream_request(prompt):
     api_url = f"{st.session_state.api_endpoint}/v1/chat/completions"
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {st.session_state.api_key}"
+    }
     
     # 構建完整模型名稱（加上供應商前綴）
     full_model_name = f"{st.session_state.selected_vendor}/{st.session_state.selected_model}"
@@ -169,7 +188,10 @@ def send_non_stream_request(prompt):
 # 函數：發送串流請求
 def send_stream_request(prompt):
     api_url = f"{st.session_state.api_endpoint}/v1/chat/completions"
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {st.session_state.api_key}"
+    }
     
     # 構建完整模型名稱（加上供應商前綴）
     full_model_name = f"{st.session_state.selected_vendor}/{st.session_state.selected_model}"

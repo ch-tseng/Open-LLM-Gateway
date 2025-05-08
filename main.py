@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from typing import List, Union, Dict, Any, Optional
@@ -64,6 +64,56 @@ load_dotenv() # 可選
 
 # 載入 .env 檔案（只需要一次）
 load_dotenv()
+
+# --- API 金鑰驗證相關 (新增) ---
+ENABLE_CHECK_APIKEY = os.getenv("ENABLE_CHECK_APIKEY", "False").lower() == "true"
+API_KEYS_WHITELIST_STR = os.getenv("api_keys_whitelist", "")
+API_KEYS_WHITELIST = {key.strip() for key in API_KEYS_WHITELIST_STR.split(',') if key.strip()}
+
+if ENABLE_CHECK_APIKEY:
+    print("INFO: API 金鑰檢查已啟用。")
+    if not API_KEYS_WHITELIST:
+        print("警告：API 金鑰檢查已啟用，但 api_keys_whitelist 為空。所有需要金鑰的請求都可能被拒絕，除非白名單被正確設定。")
+    else:
+        # 為安全起見，不在日誌中打印整個白名單，只打印數量或部分信息
+        print(f"INFO: 已載入 {len(API_KEYS_WHITELIST)} 個 API 金鑰到白名單。")
+else:
+    print("INFO: API 金鑰檢查已停用。")
+
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    """
+    驗證 API 金鑰。作為 FastAPI 依賴項使用。
+    """
+    if not ENABLE_CHECK_APIKEY:
+        return # 如果未啟用檢查，則直接通過
+
+    if not authorization:
+        print("DEBUG: 驗證失敗 - 未提供 Authorization header。")
+        raise HTTPException(
+            status_code=401,
+            detail="未提供 API 金鑰。請在 'Authorization' header 中提供金鑰 (格式: 'Bearer YOUR_API_KEY')。"
+        )
+
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        print(f"DEBUG: 驗證失敗 - Authorization header 格式錯誤: {authorization}")
+        raise HTTPException(
+            status_code=401,
+            detail="API 金鑰格式錯誤。應為 'Bearer YOUR_API_KEY'。"
+        )
+
+    token = parts[1]
+    if token not in API_KEYS_WHITELIST:
+        # 為安全起見，不在日誌中記錄嘗試失敗的 token，或只記錄部分 hash
+        print(f"DEBUG: 驗證失敗 - API 金鑰 '{token[:4]}...' 不在白名單中。")
+        raise HTTPException(
+            status_code=403,
+            detail="提供的 API 金鑰無效或沒有權限。"
+        )
+
+    print(f"DEBUG: API 金鑰 '{token[:4]}...' 驗證成功。")
+    # 此處不需要回傳值，如果沒有拋出 HTTPException，FastAPI 會認為依賴項已滿足
+    return
 
 # 讀取所有環境變數
 OPENAI_API_KEY = os.getenv("openai_api")
@@ -203,7 +253,7 @@ app = FastAPI(
 # --- API 端點 (大幅修改) ---
 
 @app.post("/v1/embeddings", response_model=EmbeddingResponse)
-async def create_embedding(request: EmbeddingRequest):
+async def create_embedding(request: EmbeddingRequest, _authorized: bool = Depends(verify_api_key)):
     """
     根據請求的模型名稱，使用 Hugging Face、OpenAI 或 Google Gemini 產生 embedding。
     """
@@ -1101,7 +1151,7 @@ async def stream_chat_completion_claude(request: ChatCompletionRequest):
 
 # --- API 端點 ---
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def create_chat_completion(request: ChatCompletionRequest):
+async def create_chat_completion(request: ChatCompletionRequest, _authorized: bool = Depends(verify_api_key)):
     """處理聊天完成請求"""
     try:
         # 根據模型名稱和 stream 參數選擇適當的處理函數
