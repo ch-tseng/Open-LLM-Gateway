@@ -58,78 +58,141 @@ def validate_apikey_format(apikey):
 # 獲取API金鑰使用統計
 def get_apikey_stats():
     """從history_apikey目錄獲取所有API金鑰的使用統計"""
-    api_keys = load_api_keys()
+    api_keys_data = load_api_keys() # Changed variable name for clarity
     stats = []
     
     # 遍歷history_apikey目錄中的所有API金鑰目錄
-    for apikey_dir in os.listdir(HISTORY_APIKEY_DIR):
-        apikey_path = os.path.join(HISTORY_APIKEY_DIR, apikey_dir)
+    if not os.path.exists(HISTORY_APIKEY_DIR):
+        print(f"Warning: API key history directory not found: {HISTORY_APIKEY_DIR}")
+        return stats
+        
+    for apikey_dir_name in os.listdir(HISTORY_APIKEY_DIR):
+        apikey_path = os.path.join(HISTORY_APIKEY_DIR, apikey_dir_name)
         
         # 跳過非目錄項或API金鑰數據文件
-        if not os.path.isdir(apikey_path) or apikey_dir == API_KEYS_FILE:
+        if not os.path.isdir(apikey_path) or apikey_dir_name == API_KEYS_FILE:
             continue
         
-        # 獲取API金鑰名稱
-        apikey = apikey_dir
+        # 獲取API金鑰名稱 (原始目錄名，可能包含 _disabled)
+        raw_apikey_name = apikey_dir_name
         
-        # 檢查是否為有效的API金鑰格式
-        if not validate_apikey_format(apikey):
-            continue
-        
-        # 初始化統計數據
-        is_disabled = apikey.endswith(DISABLED_MARK)
+        is_disabled = raw_apikey_name.endswith(DISABLED_MARK)
         if is_disabled:
-            actual_apikey = apikey[:-len(DISABLED_MARK)]
+            actual_apikey = raw_apikey_name[:-len(DISABLED_MARK)]
         else:
-            actual_apikey = apikey
+            actual_apikey = raw_apikey_name
+
+        # 檢查是否為有效的API金鑰格式 (針對 actual_apikey)
+        if not validate_apikey_format(actual_apikey):
+            print(f"Skipping directory with invalid API key format: {actual_apikey}")
+            continue
             
         total_requests = 0
         tokens_in = 0
         tokens_out = 0
-        last_access = None
+        last_access_dt = None # Use datetime object for comparison
         
-        # 遍歷API金鑰目錄中的所有日誌文件
-        for log_file in os.listdir(apikey_path):
-            if not log_file.endswith('.txt'):
+        # 遍歷API金鑰目錄中的所有日誌文件 (e.g., YYYYMMDD.txt)
+        for log_file_name in os.listdir(apikey_path):
+            if not log_file_name.endswith('.txt'): # Assuming logs are .txt files
                 continue
                 
-            log_file_path = os.path.join(apikey_path, log_file)
+            log_file_path = os.path.join(apikey_path, log_file_name)
             
-            with open(log_file_path, 'r', encoding='utf-8') as f:
-                log_content = f.read()
-                
-                # 計算請求次數（每個日誌條目都是一個請求）
-                requests_in_file = log_content.count('[20')  # 假設每條日誌都以時間戳開頭 [2024-05-xx
-                total_requests += requests_in_file
-                
-                # 獲取最後訪問時間
-                timestamps = re.findall(r'\[(.*?)\]', log_content)
-                if timestamps:
-                    file_last_access = timestamps[-1]
-                    if last_access is None or file_last_access > last_access:
-                        last_access = file_last_access
-                
-                # 計算token使用量
-                token_matches = re.findall(r'Tokens: (\d+)', log_content)
-                for token_count in token_matches:
-                    tokens_in += int(token_count)
-                    tokens_out += int(token_count) * 0.7  # 假設輸出token大約是輸入的70%
+            try:
+                with open(log_file_path, 'r', encoding='utf-8') as f:
+                    for line_number, line in enumerate(f):
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        total_requests += 1 # Count each non-empty line as a request attempt
+
+                        # Regex to capture relevant parts from the new log format
+                        # Example: [2024-05-15 10:00:00] Type: chat, Model: openai/gpt-3.5, APIKeySuffix: ...key, PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30, StatusCode: 200
+                        match = re.search(
+                            r"""^\[(.*?)\]                        # Timestamp (e.g., 2024-05-15 10:00:00)
+                            .*?Type:\s*(embedding|chat|chat_stream_attempt|chat_stream_completed|chat_error)  # Type
+                            .*?Model:\s*(.*?)                      # Model Name
+                            .*?APIKeySuffix:\s*(.*?)               # API Key Suffix
+                            .*?PromptTokens:\s*(\d+)               # Prompt Tokens
+                            .*?CompletionTokens:\s*(\d+)           # Completion Tokens
+                            .*?TotalTokens:\s*(\d+)                 # Total Tokens
+                            .*?StatusCode:\s*(\d+)                 # Status Code
+                            (?:.*?Input:\s*(.*?))?                  # Optional Input Summary
+                            (?:.*?Output:\s*(.*?))?                 # Optional Output Summary
+                            (?:.*?Error:\s*(.*?))?$                 # Optional Error Message
+                            """, 
+                            line, 
+                            re.VERBOSE
+                        )
+
+                        if match:
+                            timestamp_str = match.group(1)
+                            # request_type = match.group(2) # Not used for current stats, but available
+                            # model_name_logged = match.group(3) # Not used for current stats
+                            prompt_tokens_val = int(match.group(5))
+                            completion_tokens_val = int(match.group(6))
+                            # total_tokens_val = int(match.group(7)) # Can be used or re-calculated
+                            status_code_val = int(match.group(8))
+
+                            # Only add to token counts if request was successful (e.g., StatusCode 200)
+                            # You might want to adjust this logic based on how errors are logged or if you want to count tokens for failed requests too.
+                            if 200 <= status_code_val < 300: # Consider 2xx as success for token counting
+                                tokens_in += prompt_tokens_val
+                                tokens_out += completion_tokens_val
+                            
+                            try:
+                                current_access_dt = datetime.datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                                if last_access_dt is None or current_access_dt > last_access_dt:
+                                    last_access_dt = current_access_dt
+                            except ValueError:
+                                print(f"Warning: Could not parse timestamp '{timestamp_str}' in {log_file_path}, line {line_number + 1}")
+                        else:
+                            # Fallback for old log format or lines that don't match
+                            # This part tries to salvage data if old logs exist or for simpler log lines.
+                            # It might be less accurate or conflict if new logs are partially formed.
+                            # Consider removing or adjusting this fallback if only new log format is expected.
+                            legacy_token_match = re.search(r'Tokens: (\d+)', line)
+                            if legacy_token_match:
+                                tokens_val = int(legacy_token_match.group(1))
+                                tokens_in += tokens_val # Old format didn't distinguish in/out well
+                                # tokens_out += int(tokens_val * 0.7) # Old approximation
+                            
+                            legacy_ts_match = re.search(r'\[(.*?)]', line)
+                            if legacy_ts_match:
+                                try:
+                                    current_access_dt = datetime.datetime.strptime(legacy_ts_match.group(1), "%Y-%m-%d %H:%M:%S")
+                                    if last_access_dt is None or current_access_dt > last_access_dt:
+                                        last_access_dt = current_access_dt
+                                except ValueError:
+                                    pass # Ignore if timestamp in old format is also unparseable
+                            # print(f"Warning: Could not parse log line in {log_file_path}, line {line_number + 1}: {line[:100]}...")
+            except Exception as e:
+                print(f"Error reading or processing log file {log_file_path}: {e}")
+                continue # Skip to next log file if one is broken
         
-        # 獲取創建時間（從API金鑰的日期部分）
-        try:
-            date_part = actual_apikey.split('-')[1]
-            created_at = f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]}"
-        except:
-            created_at = "未知"
+        # 獲取創建時間 (從API金鑰的日期部分，或從 api_keys_data)
+        key_creation_info = api_keys_data.get(actual_apikey, {}).get("created_at")
+        if key_creation_info:
+            # Assuming created_at is stored as "YYYY-MM-DD HH:MM:SS"
+            created_at_str = key_creation_info.split(' ')[0] # Get just the date part
+        else:
+            try:
+                # Fallback to parsing from key name if not in api_keys.json (e.g. manually created folders)
+                date_part_from_key = actual_apikey.split('-')[1]
+                created_at_str = f"{date_part_from_key[:4]}-{date_part_from_key[4:6]}-{date_part_from_key[6:8]}"
+            except IndexError:
+                created_at_str = "未知"
         
         # 獲取描述（如果存在）
-        description = api_keys.get(actual_apikey, {}).get("description", "")
+        description = api_keys_data.get(actual_apikey, {}).get("description", "")
         
         # 添加到統計列表
         stats.append({
             "api_key": actual_apikey,
-            "created_at": created_at,
-            "last_access": last_access if last_access else "從未使用",
+            "created_at": created_at_str,
+            "last_access": last_access_dt.strftime("%Y-%m-%d %H:%M:%S") if last_access_dt else "從未使用",
             "total_requests": total_requests,
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,

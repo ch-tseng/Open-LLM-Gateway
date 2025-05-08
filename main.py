@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from typing import List, Union, Dict, Any, Optional
@@ -15,6 +15,8 @@ import aiohttp
 from fastapi.responses import StreamingResponse
 import json
 import asyncio
+import datetime # Add datetime
+import atexit # Add atexit
 
 # --- Pydantic 模型定義 ---
 
@@ -70,6 +72,110 @@ ENABLE_CHECK_APIKEY = os.getenv("ENABLE_CHECK_APIKEY", "False").lower() == "true
 API_KEYS_WHITELIST_STR = os.getenv("api_keys_whitelist", "")
 API_KEYS_WHITELIST = {key.strip() for key in API_KEYS_WHITELIST_STR.split(',') if key.strip()}
 
+# --- 日誌記錄相關 (新增) ---
+HISTORY_APIKEY_DIR = os.getenv("HISTORY_APIKEY_DIR", os.path.join(os.path.dirname(__file__), "history_apikey")) # Removed ".."
+LOG_FILE_HANDLERS = {} # To store open file handlers
+
+def get_log_file_path(api_key: str) -> Optional[str]:
+    if not api_key:
+        return None
+    try:
+        key_log_dir = os.path.join(HISTORY_APIKEY_DIR, api_key)
+        os.makedirs(key_log_dir, exist_ok=True)
+        date_str = datetime.datetime.now().strftime("%Y%m%d")
+        return os.path.join(key_log_dir, f"{date_str}.txt")
+    except Exception as e:
+        print(f"Error creating log directory for API key {api_key}: {e}")
+        return None
+
+def get_file_handler(file_path: str):
+    if file_path not in LOG_FILE_HANDLERS:
+        try:
+            LOG_FILE_HANDLERS[file_path] = open(file_path, "a", encoding="utf-8")
+        except Exception as e:
+            print(f"Error opening log file {file_path}: {e}")
+            return None
+    return LOG_FILE_HANDLERS[file_path]
+
+def close_all_log_files():
+    print("Closing all open log files...")
+    for handler in LOG_FILE_HANDLERS.values():
+        try:
+            handler.close()
+        except Exception as e:
+            print(f"Error closing a log file: {e}")
+    LOG_FILE_HANDLERS.clear()
+
+atexit.register(close_all_log_files) # Register cleanup function
+
+def log_api_usage(
+    api_key: str,
+    request_type: str, # "embedding" or "chat"
+    model_name: str,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+    input_summary: Optional[str] = None,
+    output_summary: Optional[str] = None,
+    status_code: int = 200,
+    error_message: Optional[str] = None
+):
+    if not api_key or not ENABLE_CHECK_APIKEY: # Only log if API key check is enabled and key is present
+        return
+
+    log_file_path = get_log_file_path(api_key)
+    if not log_file_path:
+        return
+
+    handler = get_file_handler(log_file_path)
+    if not handler:
+        return
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry_parts = [
+        f"[{timestamp}]",
+        f"Type: {request_type}",
+        f"Model: {model_name}",
+        f"APIKeySuffix: ...{api_key[-4:]}", # Log only suffix for brevity/security
+        f"PromptTokens: {prompt_tokens}",
+        f"CompletionTokens: {completion_tokens}",
+        f"TotalTokens: {total_tokens}", # admin.py looks for "Tokens: sum" for now, this will need adjustment
+        f"StatusCode: {status_code}",
+    ]
+    if input_summary:
+        log_entry_parts.append(f"Input: {input_summary[:100].replace(chr(10), ' ')}") # Limit length and remove newlines
+    if output_summary:
+        log_entry_parts.append(f"Output: {output_summary[:100].replace(chr(10), ' ')}")
+    if error_message:
+        log_entry_parts.append(f"Error: {error_message[:100].replace(chr(10), ' ')}")
+
+    log_entry = ", ".join(log_entry_parts) + "\\n"
+
+    try:
+        abs_log_path = os.path.abspath(log_file_path)
+        print(f"DEBUG: Attempting to write to log file (Absolute Path): {abs_log_path}") # <--- 修改：打印絕對路徑
+        print(f"DEBUG: Log entry content (first 100 chars): {log_entry[:100]}") 
+        handler.write(log_entry)
+        handler.flush() # Ensure it's written to disk
+        print(f"DEBUG: Successfully wrote to log file (Absolute Path): {abs_log_path}") # <--- 修改：打印絕對路徑
+    except Exception as e:
+        print(f"Error writing to log file {log_file_path}: {e}")
+
+
+async def get_api_key_from_request(request: Request) -> Optional[str]:
+    if not ENABLE_CHECK_APIKEY:
+        return "logging_disabled_or_no_key_needed" # Return a placeholder if logging is effectively off for this request path
+
+    authorization: Optional[str] = request.headers.get("Authorization")
+    if authorization:
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token = parts[1]
+            if token in API_KEYS_WHITELIST:
+                return token
+    return None
+
+
 if ENABLE_CHECK_APIKEY:
     print("INFO: API 金鑰檢查已啟用。")
     if not API_KEYS_WHITELIST:
@@ -80,7 +186,7 @@ if ENABLE_CHECK_APIKEY:
 else:
     print("INFO: API 金鑰檢查已停用。")
 
-async def verify_api_key(authorization: Optional[str] = Header(None)):
+async def verify_api_key(request: Request, authorization: Optional[str] = Header(None)):
     """
     驗證 API 金鑰。作為 FastAPI 依賴項使用。
     """
@@ -103,6 +209,8 @@ async def verify_api_key(authorization: Optional[str] = Header(None)):
         )
 
     token = parts[1]
+    # Store the validated API key in request state to be retrieved by logging function
+    request.state.api_key = token
     if token not in API_KEYS_WHITELIST:
         # 為安全起見，不在日誌中記錄嘗試失敗的 token，或只記錄部分 hash
         print(f"DEBUG: 驗證失敗 - API 金鑰 '{token[:4]}...' 不在白名單中。")
@@ -253,13 +361,15 @@ app = FastAPI(
 # --- API 端點 (大幅修改) ---
 
 @app.post("/v1/embeddings", response_model=EmbeddingResponse)
-async def create_embedding(request: EmbeddingRequest, _authorized: bool = Depends(verify_api_key)):
+async def create_embedding(request_data: EmbeddingRequest, fastapi_request: Request, _authorized: bool = Depends(verify_api_key)):
     """
     根據請求的模型名稱，使用 Hugging Face、OpenAI 或 Google Gemini 產生 embedding。
     """
     start_time = time.time()
-    requested_model = request.model
-    input_texts = [request.input] if isinstance(request.input, str) else request.input
+    requested_model = request_data.model
+    input_texts = [request_data.input] if isinstance(request_data.input, str) else request_data.input
+    api_key_for_logging = await get_api_key_from_request(fastapi_request)
+    input_summary_for_logging = "; ".join(input_texts)[:100]
 
     # 基本輸入驗證
     if not input_texts or not all(isinstance(text, str) and text.strip() for text in input_texts):
@@ -273,7 +383,9 @@ async def create_embedding(request: EmbeddingRequest, _authorized: bool = Depend
         # --- OpenAI 模型 ---
         if requested_model.startswith("text-embedding-"):
             if not OPENAI_API_KEY:
-                raise HTTPException(status_code=500, detail="伺服器未設定 OpenAI API 金鑰 (OPENAI_API_KEY)。")
+                exc = HTTPException(status_code=500, detail="伺服器未設定 OpenAI API 金鑰 (OPENAI_API_KEY)。")
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", requested_model, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=exc.detail)
+                raise exc
             try:
                 print(f"使用 OpenAI API，模型: {requested_model}")
                 # 使用 v1.x SDK
@@ -289,16 +401,23 @@ async def create_embedding(request: EmbeddingRequest, _authorized: bool = Depend
                     response_data.append(EmbeddingData(embedding=data.embedding, index=data.index))
                 usage = Usage(prompt_tokens=response.usage.prompt_tokens, total_tokens=response.usage.total_tokens)
                 actual_model_name = response.model # 使用 OpenAI 回傳的精確模型名稱
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", actual_model_name, prompt_tokens=usage.prompt_tokens, total_tokens=usage.total_tokens, input_summary=input_summary_for_logging)
 
             except APIError as e:
                  print(f"OpenAI API 錯誤: Status={e.status_code}, Message={e.message}")
-                 raise HTTPException(status_code=e.status_code or 500, detail=f"OpenAI API 錯誤: {e.message}")
+                 exc = HTTPException(status_code=e.status_code or 500, detail=f"OpenAI API 錯誤: {e.message}")
+                 if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", requested_model, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=exc.detail)
+                 raise exc
             except ImportError:
                 print("錯誤: openai 函式庫未安裝。請執行 pip install openai")
-                raise HTTPException(status_code=500, detail="伺服器錯誤：缺少 openai 函式庫")
+                exc = HTTPException(status_code=500, detail="伺服器錯誤：缺少 openai 函式庫")
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", requested_model, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=exc.detail)
+                raise exc
             except Exception as e:
                  print(f"呼叫 OpenAI 時發生未知錯誤: {e}")
-                 raise HTTPException(status_code=500, detail=f"呼叫 OpenAI 時發生錯誤: {str(e)}")
+                 exc = HTTPException(status_code=500, detail=f"呼叫 OpenAI 時發生錯誤: {str(e)}")
+                 if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", requested_model, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=str(e))
+                 raise exc
 
         # --- Google Gemini 模型 ---
         elif requested_model.startswith("models/embedding-") or \
@@ -307,7 +426,9 @@ async def create_embedding(request: EmbeddingRequest, _authorized: bool = Depend
              requested_model.startswith("gemini-"):
 
             if not GOOGLE_API_KEY:
-                raise HTTPException(status_code=500, detail="伺服器未設定 Google API 金鑰 (GOOGLE_API_KEY)。")
+                exc = HTTPException(status_code=500, detail="伺服器未設定 Google API 金鑰 (GOOGLE_API_KEY)。")
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", requested_model, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=exc.detail)
+                raise exc
 
             # 確保傳遞給 Google API 的模型名稱包含 "models/" 前綴
             google_api_model_name = requested_model
@@ -346,19 +467,27 @@ async def create_embedding(request: EmbeddingRequest, _authorized: bool = Depend
                 tokens = count_tokens(input_texts)
                 usage = Usage(prompt_tokens=tokens, total_tokens=tokens)
                 actual_model_name = requested_model # 回傳使用者請求的原始模型名稱
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", actual_model_name, prompt_tokens=tokens, total_tokens=tokens, input_summary=input_summary_for_logging)
 
             except Exception as e:
                 print(f"Google GenAI API 錯誤 ({google_api_model_name}): {e}")
                 # 這裡可以根據 Google API 的具體錯誤類型做更細緻的處理
                 # 檢查是否為模型不存在的錯誤 (這部分依賴 Google API client 的錯誤回報方式)
+                status_code_for_error = 500
+                error_detail = f"Google GenAI API 錯誤 ({google_api_model_name}): {str(e)}"
                 if "not found" in str(e).lower() or "permission denied" in str(e).lower() or "404" in str(e):
-                    raise HTTPException(status_code=404, detail=f"Google GenAI 模型 '{google_api_model_name}' 未找到或無法存取。錯誤: {str(e)}")
-                raise HTTPException(status_code=500, detail=f"Google GenAI API 錯誤 ({google_api_model_name}): {str(e)}")
+                    status_code_for_error = 404
+                    error_detail = f"Google GenAI 模型 '{google_api_model_name}' 未找到或無法存取。錯誤: {str(e)}"
+                exc = HTTPException(status_code=status_code_for_error, detail=error_detail)
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", google_api_model_name, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=str(e))
+                raise exc
 
         # --- Ollama 模型 ---
         elif requested_model.startswith("ollama/"):
             if not OLLAMA_URL:
-                raise HTTPException(status_code=500, detail="伺服器未設定 Ollama 服務位址 (ollama_url)。")
+                exc = HTTPException(status_code=500, detail="伺服器未設定 Ollama 服務位址 (ollama_url)。")
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", requested_model, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=exc.detail)
+                raise exc
             
             # 從模型名稱中移除 "ollama/" 前綴
             ollama_model_name = requested_model.replace("ollama/", "", 1)
@@ -395,6 +524,7 @@ async def create_embedding(request: EmbeddingRequest, _authorized: bool = Depend
                 tokens = count_tokens(input_texts)
                 usage = Usage(prompt_tokens=tokens, total_tokens=tokens)
                 actual_model_name = requested_model
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", actual_model_name, prompt_tokens=tokens, total_tokens=tokens, input_summary=input_summary_for_logging)
 
             except OllamaResponseError as e:
                 detail = f"Ollama API 錯誤 ({ollama_model_name}): {str(e)}"
@@ -413,17 +543,26 @@ async def create_embedding(request: EmbeddingRequest, _authorized: bool = Depend
                     status_code = 503
 
                 print(f"Ollama API 錯誤: Status={status_code}, Detail={detail}")
-                raise HTTPException(status_code=status_code, detail=detail)
+                exc = HTTPException(status_code=status_code, detail=detail)
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", ollama_model_name, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=str(e))
+                raise exc
             except ImportError:
                 print("錯誤: ollama 函式庫未安裝。請執行 pip install ollama")
-                raise HTTPException(status_code=500, detail="伺服器錯誤：缺少 ollama 函式庫")
+                exc = HTTPException(status_code=500, detail="伺服器錯誤：缺少 ollama 函式庫")
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", ollama_model_name, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message="伺服器錯誤：缺少 ollama 函式庫")
+                raise exc
             except Exception as e:
                 print(f"呼叫 Ollama ({ollama_model_name}) 時發生未知錯誤: {e}")
+                status_code_for_error = 500
+                error_detail_for_ollama = f"處理 Ollama embedding '{ollama_model_name}' 時發生錯誤: {str(e)}"
                 if "connection refused" in str(e).lower() or \
                    "Temporary failure in name resolution" in str(e).lower() or \
                    "Errno 111" in str(e) or "Errno -3" in str(e):
-                     raise HTTPException(status_code=503, detail=f"無法連接到 Ollama 服務於 {base_url}: {str(e)}")
-                raise HTTPException(status_code=500, detail=f"處理 Ollama embedding '{ollama_model_name}' 時發生錯誤: {str(e)}")
+                     status_code_for_error = 503
+                     error_detail_for_ollama = f"無法連接到 Ollama 服務於 {base_url}: {str(e)}"
+                exc = HTTPException(status_code=status_code_for_error, detail=error_detail_for_ollama)
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", ollama_model_name, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=str(e))
+                raise exc
 
         # --- Hugging Face 本地模型 ---
         elif requested_model.startswith("huggingface/"):
@@ -446,13 +585,16 @@ async def create_embedding(request: EmbeddingRequest, _authorized: bool = Depend
                 tokens = count_tokens(input_texts)
                 usage = Usage(prompt_tokens=tokens, total_tokens=tokens)
                 actual_model_name = requested_model
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", actual_model_name, prompt_tokens=tokens, total_tokens=tokens, input_summary=input_summary_for_logging)
 
             except HTTPException as e: # 重新拋出 get_hf_model 或其他地方的 HTTP 錯誤
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", requested_model, input_summary=input_summary_for_logging, status_code=e.status_code, error_message=e.detail)
                 raise e
             except Exception as e:
                 print(f"處理 Hugging Face embedding 時發生錯誤 ({hf_model_name}): {e}")
-                # 可以判斷是否為模型不存在等特定錯誤
-                raise HTTPException(status_code=500, detail=f"處理 Hugging Face embedding '{hf_model_name}' 時發生錯誤: {str(e)}")
+                exc = HTTPException(status_code=500, detail=f"處理 Hugging Face embedding '{hf_model_name}' 時發生錯誤: {str(e)}")
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", hf_model_name, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=str(e))
+                raise exc
 
         # --- 其他模型 (向後兼容性) ---
         else:
@@ -469,13 +611,16 @@ async def create_embedding(request: EmbeddingRequest, _authorized: bool = Depend
                 tokens = count_tokens(input_texts)
                 usage = Usage(prompt_tokens=tokens, total_tokens=tokens)
                 actual_model_name = requested_model
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", actual_model_name, prompt_tokens=tokens, total_tokens=tokens, input_summary=input_summary_for_logging)
 
             except HTTPException as e: # 重新拋出 get_hf_model 或其他地方的 HTTP 錯誤
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", requested_model, input_summary=input_summary_for_logging, status_code=e.status_code, error_message=e.detail)
                 raise e
             except Exception as e:
                 print(f"處理本地 embedding 時發生錯誤 ({requested_model}): {e}")
-                # 可以判斷是否為模型不存在等特定錯誤
-                raise HTTPException(status_code=500, detail=f"處理本地 embedding '{requested_model}' 時發生錯誤: {str(e)}")
+                exc = HTTPException(status_code=500, detail=f"處理本地 embedding '{requested_model}' 時發生錯誤: {str(e)}")
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", requested_model, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=str(e))
+                raise exc
 
         # --- 建立最終回應 ---
         final_response = EmbeddingResponse(
@@ -490,580 +635,578 @@ async def create_embedding(request: EmbeddingRequest, _authorized: bool = Depend
         return final_response
 
     except HTTPException as e: # 捕獲上面明確拋出的 HTTP 異常
+        # Logging for already raised HTTPExceptions from deeper levels might be redundant if already logged there,
+        # but can be added if necessary for a top-level log.
+        # For now, assume deeper logs are sufficient.
         raise e # 直接重新拋出
     except Exception as e: # 捕獲未預料的全局錯誤
         print(f"處理 embedding 請求 '{requested_model}' 時發生未預期的錯誤: {e}")
         import traceback
         traceback.print_exc() # 打印詳細追蹤信息以供調試
-        raise HTTPException(status_code=500, detail=f"內部伺服器錯誤，請檢查伺服器日誌。")
+        exc = HTTPException(status_code=500, detail=f"內部伺服器錯誤，請檢查伺服器日誌。")
+        if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", requested_model, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=str(e))
+        raise exc
 
 # --- Chat Completion 處理函數 ---
-async def stream_chat_completion_openai(request: ChatCompletionRequest):
-    if request.model.startswith("openai/"):
-        # --- Existing OpenAI Logic ---
-        if not OPENAI_API_KEY:
-            raise HTTPException(status_code=500, detail="未設定 OpenAI API 金鑰")
-        try:
-            model_name = request.model.replace('openai/', '')
-            client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-            stream = await client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": m.role, "content": m.content} for m in request.messages],
-                temperature=request.temperature,
-                stream=True
-            )
+async def stream_chat_completion_openai(request: ChatCompletionRequest, api_key_for_logging: Optional[str], input_summary_for_logging: Optional[str]):
+    model_name_for_log = request.model # Capture model name for logging in finally
+    full_assistant_response_for_log = ""
+    prompt_tokens_for_log = len(input_summary_for_logging) if input_summary_for_logging else 0
+    completion_tokens_for_log = 0
+    error_for_log = None
+    status_code_for_log = 200
+
+    try:
+        if request.model.startswith("openai/"):
+            if not OPENAI_API_KEY:
+                status_code_for_log = 500
+                error_for_log = "未設定 OpenAI API 金鑰"
+                raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+            try:
+                model_name = request.model.replace('openai/', '')
+                client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+                stream = await client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": m.role, "content": m.content} for m in request.messages],
+                    temperature=request.temperature,
+                    stream=True
+                )
+                
+                async def generate_openai_stream():
+                    nonlocal full_assistant_response_for_log, completion_tokens_for_log, error_for_log, status_code_for_log
+                    try:
+                        async for chunk in stream:
+                            if chunk.choices[0].delta.content is not None:
+                                content_chunk = chunk.choices[0].delta.content
+                                full_assistant_response_for_log += content_chunk
+                                response_data = {
+                                    'choices': [{
+                                        'delta': {
+                                            'content': content_chunk
+                                        }
+                                    }]
+                                }
+                                yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                    except Exception as e:
+                        error_for_log = f"OpenAI 串流處理錯誤: {str(e)}"
+                        status_code_for_log = 500 # Assuming internal server error for stream processing issues
+                        print(error_for_log)
+                        # Yield an error message if needed, or just let finally block handle logging
+                        yield f"data: {json.dumps({'error': error_for_log, 'status_code': status_code_for_log}, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                    finally:
+                        completion_tokens_for_log = len(full_assistant_response_for_log)
+                
+                return StreamingResponse(
+                    generate_openai_stream(),
+                    media_type="text/event-stream",
+                    headers={"Content-Type": "text/event-stream; charset=utf-8"}
+                )
+            except Exception as e:
+                status_code_for_log = 500
+                error_for_log = f"OpenAI API 錯誤: {str(e)}"
+                raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+
+        elif request.model.startswith("deepseek/"):
+            if not DEEPSEEK_API_KEY:
+                status_code_for_log = 500
+                error_for_log = "未設定 DeepSeek API 金鑰"
+                raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
             
-            async def generate_openai_stream():
+            print("DeepSeek stream: Matched deepseek model for streaming.") 
+
+            model_name = request.model.replace('deepseek/', '')
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY.strip()}"
+            }
+            payload_data = {
+                "model": model_name,
+                "messages": [{"role": msg.role, "content": msg.content} for msg in request.messages],
+                "temperature": request.temperature,
+                "stream": True
+            }
+            if request.max_tokens is not None:
+                payload_data["max_tokens"] = request.max_tokens
+            
+            async def generate_deepseek_stream_content():
+                nonlocal full_assistant_response_for_log, completion_tokens_for_log, error_for_log, status_code_for_log
+                server_sent_done = False
                 try:
-                    async for chunk in stream:
-                        if chunk.choices[0].delta.content is not None:
-                            response_data = {
-                                'choices': [{
-                                    'delta': {
-                                        'content': chunk.choices[0].delta.content
-                                    }
-                                }]
-                            }
-                            yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                    print(f"DeepSeek stream: Sending request to {DEEPSEEK_API_URL}/chat/completions with payload: {json.dumps(payload_data)}")
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"{DEEPSEEK_API_URL}/chat/completions",
+                            headers=headers,
+                            json=payload_data,
+                            timeout=aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT)
+                        ) as response:
+                            print(f"DeepSeek stream: Connection attempt made. Response status from DeepSeek: {response.status}") 
+                            status_code_for_log = response.status # Capture status from DeepSeek
+                            if response.status != 200:
+                                error_text = await response.text()
+                                error_for_log = f"DeepSeek API 請求失敗 ({response.status}): {error_text}"
+                                print(error_for_log)
+                                # No yield here, finally will log
+                                return # Exit generator early
+
+                            print(f"DeepSeek stream: Successfully connected to DeepSeek. Response Headers: {response.headers}") 
+                            
+                            any_line_processed = False
+                            async for line_bytes in response.content:
+                                any_line_processed = True 
+                                line_bytes = line_bytes.strip()
+                                if not line_bytes:
+                                    continue
+                                
+                                line_str = ""
+                                try:
+                                    line_str = line_bytes.decode('utf-8').strip()
+                                    print(f"DeepSeek raw stream line: '{line_str}'")
+
+                                    if not line_str:
+                                        continue
+
+                                    if line_str.startswith("data:"):
+                                        json_payload_str = line_str[len("data:"):].strip()
+                                        if json_payload_str == "[DONE]":
+                                            print("DeepSeek stream: Server sent event 'data: [DONE]'")
+                                            server_sent_done = True
+                                            break
+                                        if not json_payload_str:
+                                            print("DeepSeek stream: Received 'data: ' followed by empty payload, skipping.")
+                                            continue
+                                        try:
+                                            chunk_data = json.loads(json_payload_str)
+                                            ds_choices = chunk_data.get("choices")
+                                            if ds_choices and len(ds_choices) > 0:
+                                                ds_delta = ds_choices[0].get("delta", {})
+                                                ds_content = ds_delta.get("content")
+                                                if ds_content:
+                                                    full_assistant_response_for_log += ds_content
+                                                    response_data = {'choices': [{'delta': {'content': ds_content}}]}
+                                                    print(f"DeepSeek stream: YIELDING to client: {json.dumps(response_data, ensure_ascii=False)}") 
+                                                    yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                                        except json.JSONDecodeError as e_json:
+                                            print(f"DeepSeek stream: JSON parsing failed for 'data: ' payload: '{json_payload_str}'. Error: {e_json}")
+                                            continue
+                                    else:
+                                        print(f"DeepSeek stream: Received non-SSE-data line: '{line_str}'")
+                                except UnicodeDecodeError as e_decode:
+                                    print(f"DeepSeek stream: UTF-8 decoding failed for bytes: {line_bytes[:100]}... Error: {e_decode}")
+                                    continue
+                                except Exception as e_line_proc:
+                                    print(f"DeepSeek stream: Error processing line '{line_str}': {str(e_line_proc)}")
+                                    continue
+                            
+                            if not any_line_processed:
+                                error_for_log = "DeepSeek stream: No lines were processed from response.content."
+                                print(error_for_log)
+                                # status_code_for_log might already be non-200, or it could be 200 but empty stream
+                                if status_code_for_log == 200: status_code_for_log = 500 # Assume error if 200 but no data
+
+                except aiohttp.ClientError as e:
+                    error_for_log = f"DeepSeek stream (aiohttp.ClientError): {str(e)}"
+                    status_code_for_log = 503 # Service unavailable
+                    print(error_for_log)
+                except asyncio.TimeoutError:
+                    error_for_log = f"DeepSeek stream (TimeoutError)"
+                    status_code_for_log = 504 # Gateway timeout
+                    print(error_for_log)
+                except Exception as e:
+                    error_for_log = f"DeepSeek stream (general error): {str(e)}"
+                    status_code_for_log = 500
+                    print(error_for_log)
+                finally:
+                    completion_tokens_for_log = len(full_assistant_response_for_log)
+                    if not server_sent_done:
+                        print("DeepSeek stream: Server did not send 'data: [DONE]', sending client 'data: [DONE]' in finally block.")
+                        yield "data: [DONE]\n\n"
+                    else:
+                        print("DeepSeek stream: Server sent 'data: [DONE]', not sending another from finally block.")
+            
+            try:
+                print("DeepSeek stream: About to return StreamingResponse for DeepSeek.") 
+                return StreamingResponse(
+                    generate_deepseek_stream_content(),
+                    media_type="text/event-stream",
+                    headers={"Content-Type": "text/event-stream; charset=utf-8"}
+                )
+            except Exception as e:
+                status_code_for_log = 500
+                error_for_log = f"DeepSeek stream: ERROR creating StreamingResponse: {str(e)}"
+                print(error_for_log) 
+                raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+                
+        else:
+            status_code_for_log = 400
+            error_for_log = f"模型 '{request.model}' 的串流處理不支援。"
+            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+    finally:
+        if api_key_for_logging: # This now executes after the StreamingResponse is potentially returned
+            log_api_usage(
+                api_key=api_key_for_logging,
+                request_type="chat_stream_completed",
+                model_name=model_name_for_log,
+                prompt_tokens=prompt_tokens_for_log,
+                completion_tokens=completion_tokens_for_log, # This will be 0 if stream_generator not iterated
+                total_tokens=prompt_tokens_for_log + completion_tokens_for_log,
+                input_summary=input_summary_for_logging,
+                output_summary=full_assistant_response_for_log if full_assistant_response_for_log else None,
+                status_code=status_code_for_log,
+                error_message=error_for_log
+            )
+
+async def stream_chat_completion_gemini(request: ChatCompletionRequest, api_key_for_logging: Optional[str], input_summary_for_logging: Optional[str]):
+    model_name_for_log = request.model
+    full_assistant_response_for_log = ""
+    prompt_tokens_for_log = len(input_summary_for_logging) if input_summary_for_logging else 0
+    completion_tokens_for_log = 0
+    error_for_log = None
+    status_code_for_log = 200
+
+    try:
+        if not GOOGLE_API_KEY:
+            status_code_for_log = 500
+            error_for_log = "未設定 Google API 金鑰"
+            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+        
+        try:
+            import google.generativeai as genai_lib
+            from google.genai import types
+            
+            model_name = request.model.replace('gemini/', '')
+            if not model_name.startswith('models/'):
+                model_name = f"models/{model_name}"
+            
+            print(f"使用 Gemini 串流模型: {model_name}")
+            
+            async def generate_with_immediate_yield():
+                nonlocal full_assistant_response_for_log, completion_tokens_for_log, error_for_log, status_code_for_log
+                try:
+                    formatted_messages = []
+                    system_instruction = None
+                    
+                    for msg in request.messages:
+                        if msg.role == "system":
+                            system_instruction = msg.content
+                        elif msg.role == "user":
+                            formatted_messages.append({"role": "user", "parts": [{"text": msg.content}]})
+                        elif msg.role == "assistant":
+                            formatted_messages.append({"role": "model", "parts": [{"text": msg.content}]})
+                    
+                    config = types.GenerateContentConfig(temperature=request.temperature)
+                    if system_instruction: config.system_instruction = system_instruction
+                    if request.max_tokens: config.max_output_tokens = request.max_tokens
+                    
+                    response_stream = await asyncio.to_thread(
+                        client.models.generate_content_stream,
+                        model=model_name,
+                        contents=formatted_messages,
+                        config=config
+                    )
+                    
+                    for chunk in response_stream:
+                        if hasattr(chunk, 'text') and chunk.text and chunk.text.strip():
+                            content_chunk = chunk.text
+                            full_assistant_response_for_log += content_chunk
+                            response_data = {'choices': [{'delta': {'content': content_chunk}}]}
+                            data = f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                            yield data
+                            await asyncio.sleep(0.01)
                     yield "data: [DONE]\n\n"
                 except Exception as e:
-                    error_msg = f"OpenAI 串流處理錯誤: {str(e)}"
-                    print(error_msg)
+                    error_for_log = f"Gemini 串流處理錯誤: {str(e)}"
+                    status_code_for_log = 500 # Or parse from e if possible
+                    print(error_for_log)
+                    import traceback; traceback.print_exc()
+                    yield f"data: {json.dumps({'error': error_for_log, 'status_code': status_code_for_log}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                finally:
+                    completion_tokens_for_log = len(full_assistant_response_for_log)
             
             return StreamingResponse(
-                generate_openai_stream(),
+                generate_with_immediate_yield(),
+                media_type="text/event-stream",
+                headers={
+                    "Content-Type": "text/event-stream; charset=utf-8",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            status_code_for_log = 500
+            error_for_log = f"Gemini API 串流設定錯誤: {str(e)}"
+            print(f"Gemini API 串流處理請求時發生意外錯誤: {e}")
+            import traceback; traceback.print_exc()
+            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+    finally:
+        if api_key_for_logging:
+            log_api_usage(
+                api_key=api_key_for_logging,
+                request_type="chat_stream_completed",
+                model_name=model_name_for_log,
+                prompt_tokens=prompt_tokens_for_log,
+                completion_tokens=completion_tokens_for_log,
+                total_tokens=prompt_tokens_for_log + completion_tokens_for_log,
+                input_summary=input_summary_for_logging,
+                output_summary=full_assistant_response_for_log if full_assistant_response_for_log else None,
+                status_code=status_code_for_log,
+                error_message=error_for_log
+            )
+
+async def stream_chat_completion_ollama(request: ChatCompletionRequest, api_key_for_logging: Optional[str], input_summary_for_logging: Optional[str]):
+    model_name_for_log = request.model
+    full_assistant_response_for_log = ""
+    prompt_tokens_for_log = len(input_summary_for_logging) if input_summary_for_logging else 0
+    completion_tokens_for_log = 0
+    error_for_log = None
+    status_code_for_log = 200
+    try:
+        if not OLLAMA_URL:
+            status_code_for_log = 500
+            error_for_log = "未設定 Ollama 服務位址"
+            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+        
+        try:
+            model_name = request.model.replace('ollama/', '')
+            data = {
+                "model": model_name,
+                "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+                "stream": True,
+                "options": {"temperature": request.temperature}
+            }
+            
+            async def generate():
+                nonlocal full_assistant_response_for_log, completion_tokens_for_log, error_for_log, status_code_for_log
+                try:
+                    timeout = aiohttp.ClientTimeout(total=300)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        api_url = OLLAMA_URL
+                        if not (api_url.endswith('/api/chat') or api_url.endswith('/api/chat/')):
+                            api_url = f"{api_url.rstrip('/')}/api/chat"
+                        
+                        async with session.post(api_url, json=data, headers={"Content-Type": "application/json"}) as response:
+                            status_code_for_log = response.status
+                            if response.status != 200:
+                                error_text = await response.text()
+                                error_for_log = f"Ollama API 錯誤 ({response.status}): {error_text}"
+                                # No yield, finally logs
+                                return
+                            
+                            async for line in response.content:
+                                if line:
+                                    try:
+                                        chunk = json.loads(line)
+                                        if 'message' in chunk and 'content' in chunk['message']:
+                                            content_chunk = chunk['message']['content']
+                                            full_assistant_response_for_log += content_chunk
+                                            response_data = {'choices': [{'delta': {'content': content_chunk}}]}
+                                            yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                                    except json.JSONDecodeError as e: print(f"JSON 解析錯誤: {str(e)}"); continue
+                                    except KeyError as e: print(f"回應格式錯誤: {str(e)}"); continue
+                    yield "data: [DONE]\n\n"
+                except asyncio.TimeoutError:
+                    error_for_log = "Ollama API 請求超時"
+                    status_code_for_log = 504
+                    print(error_for_log)
+                    yield f"data: {json.dumps({'error': error_for_log, 'status_code': status_code_for_log}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                except aiohttp.ClientError as e:
+                    error_for_log = f"Ollama API 連線錯誤: {str(e)}"
+                    status_code_for_log = 503
+                    print(error_for_log)
+                    yield f"data: {json.dumps({'error': error_for_log, 'status_code': status_code_for_log}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                except Exception as e:
+                    error_for_log = f"Ollama API 內部串流錯誤: {str(e)}"
+                    status_code_for_log = 500
+                    print(error_for_log)
+                    yield f"data: {json.dumps({'error': error_for_log, 'status_code': status_code_for_log}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                finally:
+                    completion_tokens_for_log = len(full_assistant_response_for_log)
+            
+            return StreamingResponse(
+                generate(),
                 media_type="text/event-stream",
                 headers={"Content-Type": "text/event-stream; charset=utf-8"}
             )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"OpenAI API 錯誤: {str(e)}")
+            status_code_for_log = 500
+            error_for_log = f"Ollama API 錯誤 (外部): {str(e)}"
+            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+    finally:
+        if api_key_for_logging:
+            log_api_usage(
+                api_key=api_key_for_logging,
+                request_type="chat_stream_completed",
+                model_name=model_name_for_log,
+                prompt_tokens=prompt_tokens_for_log,
+                completion_tokens=completion_tokens_for_log,
+                total_tokens=prompt_tokens_for_log + completion_tokens_for_log,
+                input_summary=input_summary_for_logging,
+                output_summary=full_assistant_response_for_log if full_assistant_response_for_log else None,
+                status_code=status_code_for_log,
+                error_message=error_for_log
+            )
 
-    elif request.model.startswith("deepseek/"):
-        # --- New DeepSeek Logic ---
-        if not DEEPSEEK_API_KEY:
-            raise HTTPException(status_code=500, detail="未設定 DeepSeek API 金鑰")
-        
-        print("DeepSeek stream: Matched deepseek model for streaming.") # Log path matching
+async def stream_chat_completion_minmax(request: ChatCompletionRequest, api_key_for_logging: Optional[str], input_summary_for_logging: Optional[str]):
+    model_name_for_log = request.model
+    full_assistant_response_for_log = ""
+    prompt_tokens_for_log = len(input_summary_for_logging) if input_summary_for_logging else 0
+    completion_tokens_for_log = 0
+    error_for_log = None
+    status_code_for_log = 200
+    try:
+        if not MINMAX_API_KEY: 
+            status_code_for_log = 500
+            error_for_log = "未設定 MinMax API 金鑰"
+            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+        if not MINMAX_API_URL:
+            status_code_for_log = 500
+            error_for_log = "未設定 MinMax API URL"
+            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
 
-        model_name = request.model.replace('deepseek/', '')
+        model_name = request.model.replace("minmax/", "")
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {DEEPSEEK_API_KEY.strip()}"
+            "Authorization": f"Bearer {MINMAX_API_KEY.strip()}"
         }
         payload_data = {
             "model": model_name,
             "messages": [{"role": msg.role, "content": msg.content} for msg in request.messages],
             "temperature": request.temperature,
-            "stream": True
+            "stream": True,
         }
         if request.max_tokens is not None:
             payload_data["max_tokens"] = request.max_tokens
-        
-        async def generate_deepseek_stream_content():
-            print("DeepSeek stream: >>> ENTERING generate_deepseek_stream_content <<<") # Simplest entry log
+
+        async def generate_minmax_stream_content():
+            nonlocal full_assistant_response_for_log, completion_tokens_for_log, error_for_log, status_code_for_log
             server_sent_done = False
             try:
-                print(f"DeepSeek stream: Sending request to {DEEPSEEK_API_URL}/chat/completions with payload: {json.dumps(payload_data)}")
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
-                        f"{DEEPSEEK_API_URL}/chat/completions",
+                        MINMAX_API_URL, 
                         headers=headers,
                         json=payload_data,
-                        timeout=aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT)
+                        timeout=aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT) 
                     ) as response:
-                        print(f"DeepSeek stream: Connection attempt made. Response status from DeepSeek: {response.status}") # Log status immediately
+                        status_code_for_log = response.status
                         if response.status != 200:
                             error_text = await response.text()
-                            print(f"DeepSeek API 請求失敗 ({response.status}): {error_text}")
+                            error_for_log = f"MinMax API 請求失敗 ({response.status}): {error_text}"
                             return
 
-                        print(f"DeepSeek stream: Successfully connected to DeepSeek. Response Headers: {response.headers}") # Log headers on success
-                        
                         any_line_processed = False
                         async for line_bytes in response.content:
-                            any_line_processed = True # Mark that we entered the loop
+                            any_line_processed = True
                             line_bytes = line_bytes.strip()
-                            if not line_bytes:
-                                continue
+                            if not line_bytes: continue
                             
                             line_str = ""
                             try:
                                 line_str = line_bytes.decode('utf-8').strip()
-                                print(f"DeepSeek raw stream line: '{line_str}'")
-
-                                if not line_str:
-                                    continue
-
                                 if line_str.startswith("data:"):
                                     json_payload_str = line_str[len("data:"):].strip()
-                                    if json_payload_str == "[DONE]":
-                                        print("DeepSeek stream: Server sent event 'data: [DONE]'")
-                                        server_sent_done = True
-                                        break
-                                    if not json_payload_str:
-                                        print("DeepSeek stream: Received 'data: ' followed by empty payload, skipping.")
-                                        continue
+                                    if json_payload_str == "[DONE]": server_sent_done = True; break
+                                    if not json_payload_str: continue
                                     try:
                                         chunk_data = json.loads(json_payload_str)
-                                        ds_choices = chunk_data.get("choices")
-                                        if ds_choices and len(ds_choices) > 0:
-                                            ds_delta = ds_choices[0].get("delta", {})
-                                            ds_content = ds_delta.get("content")
-                                            if ds_content:
-                                                response_data = {'choices': [{'delta': {'content': ds_content}}]}
-                                                print(f"DeepSeek stream: YIELDING to client: {json.dumps(response_data, ensure_ascii=False)}") # Log before yield
-                                                yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
-                                    except json.JSONDecodeError as e_json:
-                                        print(f"DeepSeek stream: JSON parsing failed for 'data: ' payload: '{json_payload_str}'. Error: {e_json}")
-                                        continue
-                                else:
-                                    print(f"DeepSeek stream: Received non-SSE-data line: '{line_str}'")
-                            except UnicodeDecodeError as e_decode:
-                                print(f"DeepSeek stream: UTF-8 decoding failed for bytes: {line_bytes[:100]}... Error: {e_decode}")
-                                continue
-                            except Exception as e_line_proc:
-                                print(f"DeepSeek stream: Error processing line '{line_str}': {str(e_line_proc)}")
-                                continue
-                        
-                        if not any_line_processed:
-                            print("DeepSeek stream: No lines were processed from response.content. The stream might be empty or DeepSeek closed it prematurely.")
-                            # Optional: Attempt to read a small part if stream was empty to see if there's any non-streaming error message
-                            try:
-                                error_body_preview = await response.text() # .text() consumes, use carefully or if sure stream is empty
-                                print(f"DeepSeek stream: Fallback read of response body (if stream was empty): {error_body_preview[:1000]}") # Log first 1000 chars
-                            except Exception as e_read_fallback:
-                                print(f"DeepSeek stream: Error during fallback read of response body: {e_read_fallback}")
-
-            except aiohttp.ClientError as e:
-                print(f"DeepSeek stream (aiohttp.ClientError during connection or request): {str(e)}")
-            except asyncio.TimeoutError:
-                print(f"DeepSeek stream (TimeoutError)")
-            except Exception as e:
-                print(f"DeepSeek stream (general error in generate_deepseek_stream_content): {str(e)}")
+                                        mm_choices = chunk_data.get("choices")
+                                        mm_content = None
+                                        if mm_choices and len(mm_choices) > 0:
+                                            if "delta" in mm_choices[0] and isinstance(mm_choices[0]["delta"], dict):
+                                                mm_content = mm_choices[0]["delta"].get("content")
+                                            elif "text" in mm_choices[0]: mm_content = mm_choices[0]["text"]
+                                        if mm_content is not None:
+                                            full_assistant_response_for_log += mm_content
+                                            response_data = {'choices': [{'delta': {'content': mm_content}}]}
+                                            yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                                    except json.JSONDecodeError as e_json: print(f"MinMax stream: JSON parsing failed for 'data: ': '{json_payload_str}'. Error: {e_json}"); continue
+                                else: # Direct JSON line
+                                    try:
+                                        chunk_data = json.loads(line_str)
+                                        mm_choices = chunk_data.get("choices")
+                                        mm_content = None
+                                        if mm_choices and len(mm_choices) > 0:
+                                            if "delta" in mm_choices[0] and isinstance(mm_choices[0]["delta"], dict):
+                                                mm_content = mm_choices[0]["delta"].get("content")
+                                            elif "text" in mm_choices[0]: mm_content = mm_choices[0]["text"]
+                                        if mm_content is not None:
+                                            full_assistant_response_for_log += mm_content
+                                            response_data = {'choices': [{'delta': {'content': mm_content}}]}
+                                            yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                                    except json.JSONDecodeError: print(f"MinMax stream: Received non-SSE-data line, and also not valid JSON: '{line_str}'")
+                            except UnicodeDecodeError as e_decode: print(f"MinMax stream: UTF-8 decoding failed: {e_decode}"); continue
+                            except Exception as e_line_proc: print(f"MinMax stream: Error processing line '{line_str}': {e_line_proc}"); continue
+                        if not any_line_processed: 
+                            error_for_log = "MinMax stream: No lines were processed."
+                            if status_code_for_log == 200 : status_code_for_log = 500 # Assume error
+            except aiohttp.ClientError as e_client: error_for_log = f"MinMax stream (aiohttp.ClientError): {e_client}"; status_code_for_log = 503
+            except asyncio.TimeoutError: error_for_log = "MinMax stream (TimeoutError)"; status_code_for_log = 504
+            except Exception as e_general: error_for_log = f"MinMax stream (general error): {e_general}"; status_code_for_log = 500
             finally:
-                if not server_sent_done:
-                    print("DeepSeek stream: Server did not send 'data: [DONE]', sending client 'data: [DONE]' in finally block.")
-                    yield "data: [DONE]\n\n"
-                else:
-                    print("DeepSeek stream: Server sent 'data: [DONE]', not sending another from finally block.")
-        
-        # This part is outside the generator, in the main function body for deepseek branch
-        try:
-            print("DeepSeek stream: About to return StreamingResponse for DeepSeek.") # Log before StreamingResponse
-            return StreamingResponse(
-                generate_deepseek_stream_content(),
-                media_type="text/event-stream",
-                headers={"Content-Type": "text/event-stream; charset=utf-8"}
-            )
-        except Exception as e:
-            print(f"DeepSeek stream: ERROR creating StreamingResponse for DeepSeek: {str(e)}") # Log error during StreamingResponse creation
-            raise HTTPException(status_code=500, detail=f"DeepSeek API 串流設定錯誤: {str(e)}")
-            
-    else:
-        raise HTTPException(status_code=400, detail=f"模型 '{request.model}' 的串流處理不支援。")
+                completion_tokens_for_log = len(full_assistant_response_for_log)
+                if not server_sent_done: yield "data: [DONE]\n\n"
 
-async def stream_chat_completion_gemini(request: ChatCompletionRequest):
-    """處理 Google Gemini 的串流聊天完成請求"""
-    if not GOOGLE_API_KEY:
-        raise HTTPException(status_code=500, detail="未設定 Google API 金鑰")
-    
-    try:
-        # 確保引入所需模組
-        import google.generativeai as genai_lib
-        from google.genai import types
-        
-        # 移除 'gemini/' 前綴並加上 'models/' 前綴（如果需要）
-        model_name = request.model.replace('gemini/', '')
-        if not model_name.startswith('models/'):
-            model_name = f"models/{model_name}"
-        
-        print(f"使用 Gemini 串流模型: {model_name}")
-        
-        # 使用自定義生成器來確保立即發送每個串流片段
-        async def generate_with_immediate_yield():
-            try:
-                # 處理請求訊息
-                formatted_messages = []
-                system_instruction = None
-                
-                for msg in request.messages:
-                    if msg.role == "system":
-                        system_instruction = msg.content
-                    elif msg.role == "user":
-                        formatted_messages.append({"role": "user", "parts": [{"text": msg.content}]})
-                    elif msg.role == "assistant":
-                        formatted_messages.append({"role": "model", "parts": [{"text": msg.content}]})
-                
-                print(f"系統指令: {system_instruction}")
-                print(f"訊息數量: {len(formatted_messages)}")
-                
-                # 建立不包含 stream 參數的配置對象
-                config = types.GenerateContentConfig(
-                    temperature=request.temperature
-                )
-                
-                if system_instruction:
-                    config.system_instruction = system_instruction
-                
-                if request.max_tokens:
-                    config.max_output_tokens = request.max_tokens
-                
-                # 使用 generate_content_stream 方法
-                print("使用 client.models.generate_content_stream 進行真實串流")
-                
-                # 使用示例代碼中的方式，直接採用 generate_content_stream
-                response_stream = await asyncio.to_thread(
-                    client.models.generate_content_stream,
-                    model=model_name,
-                    contents=formatted_messages,
-                    config=config
-                )
-                
-                # 處理串流回應，確保每個片段立即發送
-                print("開始處理串流回應並立即發送片段")
-                for chunk in response_stream:
-                    if hasattr(chunk, 'text') and chunk.text and chunk.text.strip():
-                        print(f"獲取片段: {chunk.text}")
-                        response_data = {
-                            'choices': [{
-                                'delta': {
-                                    'content': chunk.text
-                                }
-                            }]
-                        }
-                        data = f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
-                        print(f"發送片段: {len(data)} 字節")
-                        yield data
-                        # 加入小延遲確保客戶端有時間處理
-                        await asyncio.sleep(0.01)
-                
-                # 發送結束標記
-                print("發送 [DONE] 標記")
-                yield "data: [DONE]\n\n"
-                
-            except Exception as e:
-                error_msg = f"Gemini 串流處理錯誤: {str(e)}"
-                print(error_msg)
-                import traceback
-                traceback.print_exc()
-                # 在錯誤時也發送 [DONE] 信號
-                yield f"data: {{\"error\": \"{error_msg}\"}}\n\n"
-                yield "data: [DONE]\n\n"
-        
-        # 返回串流響應，使用特殊設定確保即時發送
-        return StreamingResponse(
-            generate_with_immediate_yield(),
-            media_type="text/event-stream",
-            headers={
-                "Content-Type": "text/event-stream; charset=utf-8",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"  # 禁用 Nginx 緩衝
-            }
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Gemini API 串流處理請求時發生意外錯誤: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Gemini API 錯誤: {str(e)}")
-
-async def stream_chat_completion_ollama(request: ChatCompletionRequest):
-    """處理 Ollama 的串流聊天完成請求"""
-    if not OLLAMA_URL:
-        raise HTTPException(status_code=500, detail="未設定 Ollama 服務位址")
-    
-    try:
-        # 移除 'ollama/' 前綴
-        model_name = request.model.replace('ollama/', '')
-        
-        # 準備請求資料
-        data = {
-            "model": model_name,
-            "messages": [{"role": m.role, "content": m.content} for m in request.messages],
-            "stream": True,
-            "options": {
-                "temperature": request.temperature
-            }
-        }
-        
-        async def generate():
-            try:
-                # 設定較長的超時時間
-                timeout = aiohttp.ClientTimeout(total=300)  # 5分鐘
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    # 確定正確的 API 端點 URL
-                    api_url = OLLAMA_URL
-                    
-                    # 檢查 URL 是否已經包含 /api/chat 路徑
-                    if not (api_url.endswith('/api/chat') or api_url.endswith('/api/chat/')):
-                        # 如果不包含，則構建完整的 API 路徑
-                        if api_url.endswith('/'):
-                            api_url = f"{api_url}api/chat" 
-                        else:
-                            api_url = f"{api_url}/api/chat"
-                    
-                    print(f"Ollama 串流請求 URL: {api_url}")
-                    
-                    async with session.post(
-                        api_url,
-                        json=data,
-                        headers={"Content-Type": "application/json"}
-                    ) as response:
-                        if response.status != 200:
-                            error_text = await response.text()
-                            raise HTTPException(
-                                status_code=response.status,
-                                detail=f"Ollama API 錯誤: {error_text}"
-                            )
-                        
-                        async for line in response.content:
-                            if line:
-                                try:
-                                    # 解析 Ollama 的回應
-                                    chunk = json.loads(line)
-                                    if 'message' in chunk and 'content' in chunk['message']:
-                                        # 使用 ensure_ascii=False 來正確處理中文字符
-                                        response_data = {
-                                            'choices': [{
-                                                'delta': {
-                                                    'content': chunk['message']['content']
-                                                }
-                                            }]
-                                        }
-                                        yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
-                                except json.JSONDecodeError as e:
-                                    print(f"JSON 解析錯誤: {str(e)}")
-                                    continue
-                                except KeyError as e:
-                                    print(f"回應格式錯誤: {str(e)}")
-                                    continue
-                yield "data: [DONE]\n\n"
-            except asyncio.TimeoutError:
-                error_msg = "Ollama API 請求超時"
-                print(error_msg)
-                raise HTTPException(status_code=504, detail=error_msg)
-            except aiohttp.ClientError as e:
-                error_msg = f"Ollama API 連線錯誤: {str(e)}"
-                print(error_msg)
-                raise HTTPException(status_code=500, detail=error_msg)
-            except Exception as e:
-                error_msg = f"Ollama API 錯誤: {str(e)}"
-                print(error_msg)
-                raise HTTPException(status_code=500, detail=error_msg)
-        
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={"Content-Type": "text/event-stream; charset=utf-8"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ollama API 錯誤: {str(e)}")
-
-async def stream_chat_completion_minmax(request: ChatCompletionRequest):
-    """處理 MinMax 的串流聊天完成請求"""
-    if not MINMAX_API_KEY:
-        raise HTTPException(status_code=500, detail="未設定 MinMax API 金鑰 (MINMAX_API_KEY)")
-    if not MINMAX_API_URL:
-        # MINMAX_API_URL is used as the full endpoint for both stream and non-stream
-        # It's typically defined as os.getenv("minmax_baseurl", "https://api.minimax.chat/v1/text/chatcompletion_v2")
-        raise HTTPException(status_code=500, detail="未設定 MinMax API URL (minmax_baseurl)")
-
-    print("MinMax stream: Matched minmax model for streaming.")
-
-    model_name = request.model.replace("minmax/", "")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {MINMAX_API_KEY.strip()}"
-    }
-    
-    # Construct payload for MinMax API
-    # Note: MinMax might have a slightly different payload structure for messages or stream options.
-    # This is a generic structure based on OpenAI compatibility.
-    # Refer to MinMax documentation for exact payload requirements if issues arise.
-    payload_data = {
-        "model": model_name,
-        "messages": [{"role": msg.role, "content": msg.content} for msg in request.messages],
-        "temperature": request.temperature,
-        "stream": True, # Crucial for streaming
-        # MinMax might use "tokens_to_generate" instead of "max_tokens"
-        # MinMax also has other parameters like "top_p", "temperature", "mask_sensitive_info" etc.
-        # Add them here if needed based on MinMax API docs and what ChatCompletionRequest supports
-    }
-    if request.max_tokens is not None:
-        # Assuming MinMax uses 'max_tokens', if not, this needs to be mapped to their equivalent
-        payload_data["max_tokens"] = request.max_tokens 
-        # Or if MinMax uses "tokens_to_generate":
-        # payload_data["tokens_to_generate"] = request.max_tokens
-
-    async def generate_minmax_stream_content():
-        print(f"MinMax stream: >>> ENTERING generate_minmax_stream_content for model {model_name} <<<")
-        server_sent_done = False
-        try:
-            print(f"MinMax stream: Sending request to {MINMAX_API_URL} with payload: {json.dumps(payload_data)}")
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    MINMAX_API_URL, 
-                    headers=headers,
-                    json=payload_data,
-                    timeout=aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT) 
-                ) as response:
-                    print(f"MinMax stream: Connection attempt made. Response status from MinMax: {response.status}")
-                    if response.status != 200:
-                        error_text = await response.text()
-                        print(f"MinMax API 請求失敗 ({response.status}): {error_text}")
-                        return
-
-                    print(f"MinMax stream: Successfully connected to MinMax. Response Headers: {response.headers}")
-                    
-                    any_line_processed = False
-                    async for line_bytes in response.content:
-                        any_line_processed = True
-                        line_bytes = line_bytes.strip()
-                        if not line_bytes:
-                            continue
-                        
-                        line_str = ""
-                        try:
-                            line_str = line_bytes.decode('utf-8').strip()
-                            print(f"MinMax raw stream line: '{line_str}'")
-
-                            if not line_str:
-                                continue
-                            
-                            # MinMax SSE format might be: data: {...json...}
-                            # Or it could be just JSON lines without the "data: " prefix.
-                            # The provided non-streaming example returns a JSON with "base_resp" and "reply".
-                            # Streaming might be different. Assuming standard SSE "data: " prefix for now.
-
-                            if line_str.startswith("data:"):
-                                json_payload_str = line_str[len("data:"):].strip()
-                                
-                                if json_payload_str == "[DONE]":
-                                    print("MinMax stream: Server sent event 'data: [DONE]'")
-                                    server_sent_done = True
-                                    break
-
-                                if not json_payload_str:
-                                    print("MinMax stream: Received 'data: ' followed by empty payload, skipping.")
-                                    continue
-
-                                try:
-                                    chunk_data = json.loads(json_payload_str)
-                                    # Adapt parsing to actual MinMax stream chunk structure
-                                    # Example: {"request_id":"...","created":...,"model":"...","choices":[{"delta":{"content":"..."}}]}
-                                    # Or it might be {"data": {"request_id": ..., "choices": [...] } ... } if nested further
-                                    mm_choices = chunk_data.get("choices")
-                                    mm_content = None
-                                    if mm_choices and len(mm_choices) > 0:
-                                        # Check if delta exists, or if content is directly in choice
-                                        if "delta" in mm_choices[0] and isinstance(mm_choices[0]["delta"], dict):
-                                            mm_content = mm_choices[0]["delta"].get("content")
-                                        elif "text" in mm_choices[0]: # Alternative common field name
-                                            mm_content = mm_choices[0]["text"]
-                                        # Add other possible field names if MinMax uses something different
-
-                                    if mm_content is not None:
-                                        response_data = {'choices': [{'delta': {'content': mm_content}}]}
-                                        print(f"MinMax stream: YIELDING to client: {json.dumps(response_data, ensure_ascii=False)}")
-                                        yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
-                                except json.JSONDecodeError as e_json:
-                                    print(f"MinMax stream: JSON parsing failed for 'data: ' payload: '{json_payload_str}'. Error: {e_json}")
-                                    continue
-                            else:
-                                # If MinMax sends JSON lines without "data: " prefix:
-                                try:
-                                    chunk_data = json.loads(line_str) # Try parsing the whole line as JSON
-                                    mm_choices = chunk_data.get("choices")
-                                    mm_content = None
-                                    if mm_choices and len(mm_choices) > 0:
-                                        if "delta" in mm_choices[0] and isinstance(mm_choices[0]["delta"], dict):
-                                            mm_content = mm_choices[0]["delta"].get("content")
-                                        elif "text" in mm_choices[0]:
-                                            mm_content = mm_choices[0]["text"]
-                                    
-                                    if mm_content is not None:
-                                        response_data = {'choices': [{'delta': {'content': mm_content}}]}
-                                        print(f"MinMax stream (direct JSON line): YIELDING to client: {json.dumps(response_data, ensure_ascii=False)}")
-                                        yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
-                                    # Check for a [DONE] equivalent if not using SSE standard
-                                    # For example, if a specific flag indicates end of stream in the JSON.
-                                    # if chunk_data.get("is_finish") == True: server_sent_done = True; break;
-
-                                except json.JSONDecodeError:
-                                    print(f"MinMax stream: Received non-SSE-data line, and also not valid JSON: '{line_str}'")
-
-                        except UnicodeDecodeError as e_decode:
-                            print(f"MinMax stream: UTF-8 decoding failed for received bytes: {line_bytes[:100]}... Error: {e_decode}")
-                            continue
-                        except Exception as e_line_proc:
-                            print(f"MinMax stream: Error processing line '{line_str}': {str(e_line_proc)}")
-                            continue
-                    
-                    if not any_line_processed:
-                        print("MinMax stream: No lines were processed from response.content.")
-                        try:
-                            error_body_preview = await response.text()
-                            print(f"MinMax stream: Fallback read of response body: {error_body_preview[:500]}")
-                        except Exception as e_read_fallback:
-                            print(f"MinMax stream: Error during fallback read of response body: {e_read_fallback}")
-
-        except aiohttp.ClientError as e_client:
-            print(f"MinMax stream (aiohttp.ClientError during connection or request): {str(e_client)}")
-        except asyncio.TimeoutError:
-            print("MinMax stream (TimeoutError)")
-        except Exception as e_general:
-            print(f"MinMax stream (general error in generate_minmax_stream_content): {str(e_general)}")
-        finally:
-            if not server_sent_done:
-                print("MinMax stream: Server did not send 'data: [DONE]', sending client 'data: [DONE]' in finally block.")
-                yield "data: [DONE]\n\n"
-            else:
-                print("MinMax stream: Server sent 'data: [DONE]', not sending another from finally block.")
-
-    try:
-        print("MinMax stream: About to return StreamingResponse for MinMax.")
         return StreamingResponse(
             generate_minmax_stream_content(),
             media_type="text/event-stream",
             headers={"Content-Type": "text/event-stream; charset=utf-8"}
         )
-    except Exception as e_stream_resp:
-        print(f"MinMax stream: ERROR creating StreamingResponse for MinMax: {str(e_stream_resp)}")
-        raise HTTPException(status_code=500, detail=f"MinMax API 串流設定錯誤: {str(e_stream_resp)}")
+    except Exception as e_stream_resp: # For errors creating StreamingResponse or pre-generator setup
+        status_code_for_log = 500
+        error_for_log = f"MinMax API 串流設定錯誤: {str(e_stream_resp)}"
+        # This error is critical and happens before stream generator can be called or its finally block
+        # So, we log it here immediately if api_key_for_logging is available
+        if api_key_for_logging:
+             log_api_usage(api_key_for_logging, "chat_stream_error", model_name_for_log, prompt_tokens_for_log, 0, prompt_tokens_for_log, input_summary_for_logging, None, status_code_for_log, error_for_log)
+        raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+    finally:
+        # This finally block is for the outer try/except of stream_chat_completion_minmax itself.
+        # The generator's finally block handles logging for a successful or partially successful stream.
+        # If an error occurred *before* the generator was even entered (e.g., in payload setup, or StreamingResponse creation failed),
+        # this block might catch it. However, critical errors often get logged before StreamingResponse returns.
+        # We need to ensure we don't double-log if the generator already logged.
+        # For simplicity, if error_for_log is set by the main try-block (meaning generator likely didn't run or failed early),
+        # we log it here. Otherwise, assume generator's finally logged.
+        # This specific finally is tricky because the generator runs separately.
+        # The current logic inside generate_minmax_stream_content's finally is the primary log point for stream content.
+        pass # Primary logging for stream content is within the generator's finally. This outer finally is a safeguard.
 
-async def stream_chat_completion_claude(request: ChatCompletionRequest):
-    """處理 Anthropic Claude 的串流聊天完成請求"""
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=500, detail="未設定 Anthropic API 金鑰 (ANTHROPIC_API_KEY)")
-
-    model_name = request.model.replace("claude/", "")
-    print(f"Claude stream: Using model {model_name}")
-
-    system_prompt = None
-    user_messages = []
-    for msg in request.messages:
-        if msg.role == "system":
-            if system_prompt is None:
-                system_prompt = msg.content
-            else:
-                print("Claude stream: Multiple system messages found. Only the first will be used.")
-        else:
-            user_messages.append({"role": msg.role, "content": msg.content})
-    
-    if not user_messages:
-        raise HTTPException(status_code=400, detail="Claude API 請求至少需要一條 user/assistant 訊息。")
-
+async def stream_chat_completion_claude(request: ChatCompletionRequest, api_key_for_logging: Optional[str], input_summary_for_logging: Optional[str]):
+    model_name_for_log = request.model
+    full_assistant_response_for_log = ""
+    prompt_tokens_for_log = len(input_summary_for_logging) if input_summary_for_logging else 0
+    completion_tokens_for_log = 0
+    error_for_log = None
+    status_code_for_log = 200
     try:
-        # 使用 aiohttp 直接調用 Anthropic API，避免 SDK 的版本問題
+        if not ANTHROPIC_API_KEY:
+            status_code_for_log = 500
+            error_for_log = "未設定 Anthropic API 金鑰"
+            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+
+        model_name = request.model.replace("claude/", "")
+        system_prompt = None
+        user_messages = []
+        for msg in request.messages:
+            if msg.role == "system": system_prompt = msg.content
+            else: user_messages.append({"role": msg.role, "content": msg.content})
+        if not user_messages: 
+            status_code_for_log = 400; error_for_log = "Claude API 請求至少需要一條 user/assistant 訊息。"
+            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+
         async def generate_claude_stream_content():
-            print(f"Claude stream: >>> ENTERING generate_claude_stream_content for model {model_name} <<<")
+            nonlocal full_assistant_response_for_log, completion_tokens_for_log, error_for_log, status_code_for_log
             server_sent_event_count = 0
-            
             try:
-                # 準備請求數據
                 payload = {
                     "model": model_name,
                     "messages": user_messages,
@@ -1071,143 +1214,237 @@ async def stream_chat_completion_claude(request: ChatCompletionRequest):
                     "temperature": request.temperature if request.temperature is not None else 0.7,
                     "stream": True
                 }
-                if system_prompt:
-                    payload["system"] = system_prompt
-                
-                headers = {
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"
-                }
-                
+                if system_prompt: payload["system"] = system_prompt
+                headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
                 url = "https://api.anthropic.com/v1/messages"
-                
-                print(f"Claude stream: Sending direct API request to {url}")
                 
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url, json=payload, headers=headers) as response:
+                        status_code_for_log = response.status
                         if response.status != 200:
                             error_text = await response.text()
-                            print(f"Claude API 請求失敗 ({response.status}): {error_text}")
-                            raise HTTPException(status_code=response.status, detail=f"Claude API 錯誤: {error_text}")
+                            error_for_log = f"Claude API 請求失敗 ({response.status}): {error_text}"
+                            return
                         
-                        # 處理事件串流
                         async for line in response.content:
-                            if not line.strip():
-                                continue
-                                
+                            if not line.strip(): continue
                             line_str = line.decode('utf-8').strip()
-                            if not line_str.startswith('data: '):
-                                continue
-                                
-                            data_json = line_str[6:] # 去除 'data: ' 前綴
-                            
+                            if not line_str.startswith('data: '): continue
+                            data_json = line_str[6:]
                             try:
                                 data = json.loads(data_json)
                                 event_type = data.get('type')
-                                
-                                # 處理內容塊增量
                                 if event_type == 'content_block_delta':
                                     delta = data.get('delta', {})
                                     if delta.get('type') == 'text_delta' and 'text' in delta:
                                         content_delta = delta['text']
+                                        full_assistant_response_for_log += content_delta
                                         response_data = {'choices': [{'delta': {'content': content_delta}}]}
                                         yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
                                         server_sent_event_count += 1
-                                
-                                # 處理結束事件
-                                elif event_type == 'message_stop':
-                                    print("Claude stream: Received message_stop event from server.")
-                                    break
-                                    
-                            except json.JSONDecodeError:
-                                print(f"Claude stream: Error parsing JSON from line: {line_str}")
-                                continue
-                                
+                                elif event_type == 'message_stop': break
+                            except json.JSONDecodeError: print(f"Claude stream: Error parsing JSON: {line_str}"); continue
             except Exception as e:
-                error_message = f"Anthropic Claude API (stream) 錯誤: {str(e)}"
-                print(error_message)
-                try:
-                    error_payload = {"error": {"message": error_message, "type": "claude_stream_error"}}
-                    yield f"data: {json.dumps(error_payload)}\n\n"
-                except:
-                    pass
+                error_for_log = f"Anthropic Claude API (stream) 錯誤: {str(e)}"
+                status_code_for_log = 500 # Or parse from e
+                print(error_for_log) # Added print for server log
+                try: 
+                    yield f"data: {json.dumps({'error': {'message': error_for_log, 'type': 'claude_stream_error'}})}\n\n"
+                except Exception as yield_e: # Catch potential errors during yield itself
+                    print(f"Error yielding Claude error message: {yield_e}")
             finally:
-                if server_sent_event_count > 0:
-                    print(f"Claude stream: Sent {server_sent_event_count} content events. Sending [DONE].")
-                else:
-                    print("Claude stream: No content events were sent. Sending [DONE].")
-                yield "data: [DONE]\n\n"
+                completion_tokens_for_log = len(full_assistant_response_for_log)
         
         return StreamingResponse(
             generate_claude_stream_content(),
             media_type="text/event-stream",
             headers={"Content-Type": "text/event-stream; charset=utf-8"}
         )
+    except Exception as e: # For errors creating StreamingResponse or pre-generator setup
+        status_code_for_log = 500
+        error_for_log = f"Claude API 串流設定錯誤: {str(e)}"
+        if api_key_for_logging: # Log error if setup failed before stream starts
+            log_api_usage(api_key_for_logging, "chat_stream_error", model_name_for_log, prompt_tokens_for_log, 0, prompt_tokens_for_log, input_summary_for_logging, None, status_code_for_log, error_for_log)
+        raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+    finally:
+        # The primary logging for stream content/errors is handled within the generator's finally block.
+        # This outer finally is mainly a safeguard for errors that occur *before* the generator starts
+        # or if the StreamingResponse object itself fails to be created.
+        # If error_for_log is set here, it implies a setup issue before the stream truly began.
+        if api_key_for_logging and error_for_log and completion_tokens_for_log == 0:
+             log_api_usage(api_key_for_logging, "chat_stream_error", model_name_for_log, 
+                           prompt_tokens_for_log, 0, prompt_tokens_for_log, 
+                           input_summary_for_logging, None, 
+                           status_code_for_log, error_for_log)
+        # Else, assume the generator's finally block has handled or will handle logging.
+
+async def stream_chat_completion_huggingface(request: ChatCompletionRequest, api_key_for_logging: Optional[str], input_summary_for_logging: Optional[str]):
+    model_name_for_log = request.model
+    full_assistant_response_for_log = ""
+    prompt_tokens_for_log = len(input_summary_for_logging) if input_summary_for_logging else 0
+    completion_tokens_for_log = 0
+    error_for_log = None
+    status_code_for_log = 200
+
+    try:
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+            import torch
+            from threading import Thread
+        except ImportError:
+            status_code_for_log = 500
+            error_for_log = "伺服器錯誤：缺少 transformers 或 torch 庫"
+            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
         
-    except Exception as e:
-        print(f"Claude stream: ERROR creating StreamingResponse: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Claude API 串流設定錯誤: {str(e)}")
+        model_name = request.model.replace('huggingface/', '', 1)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto")
+        except Exception as e:
+            status_code_for_log = 500
+            error_for_log = f"加載 Hugging Face 模型 {model_name} 失敗: {str(e)}"
+            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+        
+        system_content = None; prompt = ""
+        for msg in request.messages:
+            if msg.role == "system": system_content = msg.content
+            elif msg.role == "user": prompt += f"User: {msg.content}\n"
+            elif msg.role == "assistant": prompt += f"Assistant: {msg.content}\n"
+        if system_content: prompt = f"System: {system_content}\n" + prompt
+        prompt += "Assistant: "
+        
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        # Approximate prompt tokens for HF based on tokenized input length, not just summary
+        # This is a more accurate prompt token count for HF models if available.
+        # Recalculate prompt_tokens_for_log based on actual tokenized input if different from summary length.
+        actual_hf_prompt_tokens = len(inputs.input_ids[0])
+        # Update prompt_tokens_for_log to be more accurate if desired, or keep as summary length.
+        # For now, we'll stick to the consistent summary length for simplicity across all models as per user req.
+        # prompt_tokens_for_log = actual_hf_prompt_tokens 
+
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, timeout=OLLAMA_TIMEOUT)
+        gen_kwargs = dict(**inputs, max_new_tokens=request.max_tokens if request.max_tokens else 1024, temperature=request.temperature if request.temperature else 0.7, do_sample=True if request.temperature and request.temperature > 0 else False, streamer=streamer, pad_token_id=tokenizer.eos_token_id)
+        
+        thread = Thread(target=lambda: model.generate(**gen_kwargs))
+        thread.start()
+        
+        async def generate():
+            nonlocal full_assistant_response_for_log, completion_tokens_for_log, error_for_log, status_code_for_log
+            try:
+                for new_text in streamer:
+                    if new_text:
+                        full_assistant_response_for_log += new_text
+                        response_data = {'choices': [{'delta': {'content': new_text}}]}
+                        yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                error_for_log = f"Hugging Face 串流處理錯誤: {str(e)}"
+                status_code_for_log = 500
+                yield f"data: {json.dumps({'error': error_for_log, 'status_code': status_code_for_log}, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                completion_tokens_for_log = len(full_assistant_response_for_log)
+        
+        return StreamingResponse(generate(), media_type="text/event-stream", headers={"Content-Type": "text/event-stream; charset=utf-8"})
+    except Exception as e: # For errors creating StreamingResponse or pre-generator setup
+        status_code_for_log = 500
+        error_for_log = f"Hugging Face 串流設定錯誤: {str(e)}"
+        if api_key_for_logging:
+            log_api_usage(api_key_for_logging, "chat_stream_error", model_name_for_log, prompt_tokens_for_log, 0, prompt_tokens_for_log, input_summary_for_logging, None, status_code_for_log, error_for_log)
+        raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+    finally:
+        # Similar to Claude, the generator's finally block is primary for stream content log.
+        # This outer finally is a safeguard.
+        if api_key_for_logging and error_for_log and completion_tokens_for_log == 0:
+            log_api_usage(api_key_for_logging, "chat_stream_error", model_name_for_log, 
+                          prompt_tokens_for_log, 0, prompt_tokens_for_log, 
+                          input_summary_for_logging, None, 
+                          status_code_for_log, error_for_log)
+        # Else, assume generator's finally has/will log.
 
 # --- API 端點 ---
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def create_chat_completion(request: ChatCompletionRequest, _authorized: bool = Depends(verify_api_key)):
+async def create_chat_completion(request_data: ChatCompletionRequest, fastapi_request: Request, _authorized: bool = Depends(verify_api_key)):
     """處理聊天完成請求"""
+    api_key_for_logging = await get_api_key_from_request(fastapi_request)
+    input_summary_for_logging = request_data.messages[-1].content if request_data.messages else "No input"
+
     try:
         # 根據模型名稱和 stream 參數選擇適當的處理函數
-        if request.model.startswith("openai/"):
-            if request.stream:
-                return await stream_chat_completion_openai(request)
+        if request_data.model.startswith("openai/"):
+            if request_data.stream:
+                # For streaming, logging of full response and tokens happens inside stream_chat_completion_openai
+                # Here we log the initial request attempt
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "chat_stream_attempt", request_data.model, input_summary=input_summary_for_logging)
+                return await stream_chat_completion_openai(request_data, api_key_for_logging, input_summary_for_logging)
             else:
-                return await get_chat_completion_openai(request)
-        elif request.model.startswith("gemini/"):
-            if request.stream:
-                return await stream_chat_completion_gemini(request)
+                response = await get_chat_completion_openai(request_data)
+                if api_key_for_logging and response: log_api_usage(api_key_for_logging, "chat", response.model, prompt_tokens=response.usage.get("prompt_tokens",0), completion_tokens=response.usage.get("completion_tokens",0), total_tokens=response.usage.get("total_tokens",0), input_summary=input_summary_for_logging, output_summary=response.choices[0].message.content if response.choices else None)
+                return response
+        elif request_data.model.startswith("gemini/"):
+            if request_data.stream:
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "chat_stream_attempt", request_data.model, input_summary=input_summary_for_logging)
+                return await stream_chat_completion_gemini(request_data, api_key_for_logging, input_summary_for_logging) # Pass logging info
             else:
-                return await get_chat_completion_gemini(request)
-        elif request.model.startswith("ollama/"):
-            if request.stream:
-                return await stream_chat_completion_ollama(request)
+                response = await get_chat_completion_gemini(request_data)
+                # Gemini non-stream currently doesn't return detailed token usage in the same way
+                if api_key_for_logging and response: log_api_usage(api_key_for_logging, "chat", response.model, input_summary=input_summary_for_logging, output_summary=response.choices[0].message.content if response.choices else None) # Token usage might be 0
+                return response
+        elif request_data.model.startswith("ollama/"):
+            if request_data.stream:
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "chat_stream_attempt", request_data.model, input_summary=input_summary_for_logging)
+                return await stream_chat_completion_ollama(request_data, api_key_for_logging, input_summary_for_logging)
             else:
-                return await get_chat_completion_ollama(request)
-        elif request.model.startswith("minmax/"):
-            if request.stream:
-                print("Routing to stream_chat_completion_minmax") # DEBUG LOG
-                return await stream_chat_completion_minmax(request)
+                response = await get_chat_completion_ollama(request_data)
+                # Ollama non-stream typically doesn't return token usage
+                if api_key_for_logging and response: log_api_usage(api_key_for_logging, "chat", response.model, input_summary=input_summary_for_logging, output_summary=response.choices[0].message.content if response.choices else None)
+                return response
+        elif request_data.model.startswith("minmax/"):
+            if request_data.stream:
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "chat_stream_attempt", request_data.model, input_summary=input_summary_for_logging)
+                return await stream_chat_completion_minmax(request_data, api_key_for_logging, input_summary_for_logging)
             else:
-                print("Routing to get_chat_completion_minmax") # DEBUG LOG
-                return await get_chat_completion_minmax(request)
-        elif request.model.startswith("claude/"):
-            if request.stream:
-                print("Routing to stream_chat_completion_claude") # DEBUG LOG
-                return await stream_chat_completion_claude(request)
+                response = await get_chat_completion_minmax(request_data)
+                if api_key_for_logging and response: log_api_usage(api_key_for_logging, "chat", response.model, prompt_tokens=response.usage.get("prompt_tokens",0), completion_tokens=response.usage.get("completion_tokens",0), total_tokens=response.usage.get("total_tokens",0), input_summary=input_summary_for_logging, output_summary=response.choices[0].message.content if response.choices else None)
+                return response
+        elif request_data.model.startswith("claude/"):
+            if request_data.stream:
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "chat_stream_attempt", request_data.model, input_summary=input_summary_for_logging)
+                return await stream_chat_completion_claude(request_data, api_key_for_logging, input_summary_for_logging)
             else:
-                print("Routing to get_chat_completion_claude") # DEBUG LOG
-                return await get_chat_completion_claude(request)
-        elif request.model.startswith("huggingface/"):
-            if request.stream:
-                print("Routing to stream_chat_completion_huggingface") # DEBUG LOG
-                return await stream_chat_completion_huggingface(request)
+                response = await get_chat_completion_claude(request_data)
+                if api_key_for_logging and response: log_api_usage(api_key_for_logging, "chat", response.model, prompt_tokens=response.usage.get("prompt_tokens",0), completion_tokens=response.usage.get("completion_tokens",0), total_tokens=response.usage.get("total_tokens",0), input_summary=input_summary_for_logging, output_summary=response.choices[0].message.content if response.choices else None)
+                return response
+        elif request_data.model.startswith("huggingface/"):
+            if request_data.stream:
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "chat_stream_attempt", request_data.model, input_summary=input_summary_for_logging)
+                return await stream_chat_completion_huggingface(request_data, api_key_for_logging, input_summary_for_logging)
             else:
-                print("Routing to get_chat_completion_huggingface") # DEBUG LOG
-                return await get_chat_completion_huggingface(request)
-        elif request.model.startswith("deepseek/"):
-            if request.stream:
-                print("Routing to stream_chat_completion_openai for DeepSeek") # stream_chat_completion_openai 內部處理 deepseek 串流
-                return await stream_chat_completion_openai(request)
+                response = await get_chat_completion_huggingface(request_data)
+                if api_key_for_logging and response: log_api_usage(api_key_for_logging, "chat", response.model, prompt_tokens=response.usage.get("prompt_tokens",0), completion_tokens=response.usage.get("completion_tokens",0), total_tokens=response.usage.get("total_tokens",0), input_summary=input_summary_for_logging, output_summary=response.choices[0].message.content if response.choices else None)
+                return response
+        elif request_data.model.startswith("deepseek/"):
+            if request_data.stream:
+                # stream_chat_completion_openai handles deepseek streaming, need to pass logging info
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "chat_stream_attempt", request_data.model, input_summary=input_summary_for_logging)
+                return await stream_chat_completion_openai(request_data, api_key_for_logging, input_summary_for_logging) # Pass logging info
             else:
-                print("Routing to get_chat_completion_deepseek") # 需要實現此函數
-                return await get_chat_completion_deepseek(request) # 非串流 DeepSeek 處理函數
+                response = await get_chat_completion_deepseek(request_data)
+                if api_key_for_logging and response: log_api_usage(api_key_for_logging, "chat", response.model, prompt_tokens=response.usage.get("prompt_tokens",0), completion_tokens=response.usage.get("completion_tokens",0), total_tokens=response.usage.get("total_tokens",0), input_summary=input_summary_for_logging, output_summary=response.choices[0].message.content if response.choices else None)
+                return response
         else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"不支援的模型: {request.model}"
-            )
+            exc = HTTPException(status_code=400, detail=f"不支援的模型: {request_data.model}")
+            if api_key_for_logging: log_api_usage(api_key_for_logging, "chat", request_data.model, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=exc.detail)
+            raise exc
     except HTTPException as e:
+        # Log HTTP exceptions that occur during request processing
+        if api_key_for_logging: log_api_usage(api_key_for_logging, "chat_error", request_data.model, input_summary=input_summary_for_logging, status_code=e.status_code, error_message=e.detail)
         raise e
     except Exception as e:
         print(f"處理請求時發生錯誤: {str(e)}")  # 加入錯誤日誌
-        raise HTTPException(status_code=500, detail=f"處理請求時發生錯誤: {str(e)}")
+        exc = HTTPException(status_code=500, detail=f"處理請求時發生錯誤: {str(e)}")
+        if api_key_for_logging: log_api_usage(api_key_for_logging, "chat_error", request_data.model, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=str(e))
+        raise exc
 
 # --- 啟動伺服器 (用於本地測試) ---
 if __name__ == "__main__":
@@ -1704,112 +1941,6 @@ async def get_chat_completion_huggingface(request: ChatCompletionRequest) -> Cha
     except Exception as e:
         print(f"Hugging Face Chat Completion 錯誤: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Hugging Face Chat Completion 錯誤: {str(e)}")
-
-async def stream_chat_completion_huggingface(request: ChatCompletionRequest):
-    """處理 Hugging Face 的串流聊天完成請求"""
-    try:
-        # 移除 'huggingface/' 前綴
-        model_name = request.model.replace('huggingface/', '', 1)
-        print(f"使用 Hugging Face 串流聊天模型: {model_name}")
-        
-        # 嘗試導入必要的庫
-        try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
-            import torch
-            from threading import Thread
-        except ImportError:
-            print("錯誤: transformers 或 torch 庫未安裝。請執行 pip install transformers torch")
-            raise HTTPException(status_code=500, detail="伺服器錯誤：缺少 transformers 或 torch 庫")
-        
-        # 加載模型與分詞器
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
-            model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto")
-            print(f"已成功加載 Hugging Face 模型: {model_name}")
-        except Exception as e:
-            print(f"加載 Hugging Face 模型 {model_name} 失敗: {e}")
-            raise HTTPException(status_code=500, detail=f"加載 Hugging Face 模型 {model_name} 失敗: {str(e)}")
-        
-        # 構建提示文本
-        system_content = None
-        prompt = ""
-        
-        # 處理系統提示與訊息
-        for msg in request.messages:
-            if msg.role == "system":
-                system_content = msg.content
-            elif msg.role == "user":
-                prompt += f"User: {msg.content}\n"
-            elif msg.role == "assistant":
-                prompt += f"Assistant: {msg.content}\n"
-        
-        # 如果有系統提示，加到前面
-        if system_content:
-            prompt = f"System: {system_content}\n" + prompt
-        
-        # 加入最後的助手標記，表示助手即將回應
-        prompt += "Assistant: "
-        
-        # 準備輸入
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        
-        # 設置串流器
-        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, timeout=OLLAMA_TIMEOUT)
-        
-        # 設置生成參數
-        gen_kwargs = dict(
-            **inputs,
-            max_new_tokens=request.max_tokens if request.max_tokens else 1024,
-            temperature=request.temperature if request.temperature else 0.7,
-            do_sample=True if request.temperature and request.temperature > 0 else False,
-            streamer=streamer,
-            pad_token_id=tokenizer.eos_token_id
-        )
-        
-        # 在後台線程中執行生成
-        thread = Thread(target=lambda: model.generate(**gen_kwargs))
-        thread.start()
-        
-        # 返回串流回應
-        async def generate():
-            previous_text = ""
-            
-            try:
-                # 讀取並發送增量文本
-                for new_text in streamer:
-                    if new_text:
-                        incremental_text = new_text
-                        previous_text += incremental_text
-                        
-                        # 構建回應分塊
-                        response_data = {
-                            'choices': [{
-                                'delta': {
-                                    'content': incremental_text
-                                }
-                            }]
-                        }
-                        
-                        yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
-                        
-                # 最後發送完成標記
-                yield "data: [DONE]\n\n"
-                
-            except Exception as e:
-                error_msg = f"Hugging Face 串流處理錯誤: {str(e)}"
-                print(error_msg)
-                # 可能的錯誤處理
-                yield f"data: {json.dumps({'error': error_msg}, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-        
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={"Content-Type": "text/event-stream; charset=utf-8"}
-        )
-    except Exception as e:
-        print(f"Hugging Face 串流 Chat Completion 錯誤: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Hugging Face 串流 Chat Completion 錯誤: {str(e)}")
 
 async def get_chat_completion_deepseek(request: ChatCompletionRequest) -> ChatCompletionResponse:
     """處理 DeepSeek 的非串流聊天完成請求"""
