@@ -94,10 +94,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 ### 3.1 CURL 範例
 
+**注意：以下 Authorization: Bearer ... 為本 API 伺服器驗證用金鑰，僅當本伺服器啟用 API 金鑰驗證功能時才需提供，請使用您於本系統產生的有效 API 金鑰。**
+
 **OpenAI Embedding**:
 ```bash
 curl -X POST "http://localhost:8000/v1/embeddings" \
      -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $OPENAI_API_KEY" \
      -d '{
        "model": "text-embedding-3-small",
        "input": "這是一段需要嵌入的文本。"
@@ -108,6 +111,7 @@ curl -X POST "http://localhost:8000/v1/embeddings" \
 ```bash
 curl -X POST "http://localhost:8000/v1/embeddings" \
      -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $GOOGLE_API_KEY" \
      -d '{
        "model": "models/embedding-001",
        "input": "這是一段需要嵌入的文本。"
@@ -118,6 +122,7 @@ curl -X POST "http://localhost:8000/v1/embeddings" \
 ```bash
 curl -X POST "http://localhost:8000/v1/embeddings" \
      -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $OLLAMA_API_KEY" \
      -d '{
        "model": "ollama/nomic-embed-text",
        "input": "這是一段需要嵌入的文本。"
@@ -128,6 +133,7 @@ curl -X POST "http://localhost:8000/v1/embeddings" \
 ```bash
 curl -X POST "http://localhost:8000/v1/embeddings" \
      -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $HF_TOKEN" \
      -d '{
        "model": "huggingface/bge-large-zh-v1.5",
        "input": "這是一段需要嵌入的文本。"
@@ -173,7 +179,7 @@ import json
 
 # 設定 API 端點
 api_url = "http://localhost:8000/v1/embeddings"
-headers = {"Content-Type": "application/json"}
+headers = {"Content-Type": "application/json", "Authorization": "Bearer $OPENAI_API_KEY"}
 
 # 選擇模型
 model_name = "text-embedding-3-small"       # OpenAI
@@ -215,10 +221,13 @@ except requests.exceptions.RequestException as e:
 
 ### 4.1 CURL 範例
 
+**注意：以下 Authorization: Bearer ... 為本 API 伺服器驗證用金鑰，僅當本伺服器啟用 API 金鑰驗證功能時才需提供，請使用您於本系統產生的有效 API 金鑰。**
+
 **OpenAI GPT (非串流)**:
 ```bash
 curl -X POST "http://localhost:8000/v1/chat/completions" \
      -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $OPENAI_API_KEY" \
      -d '{
        "model": "openai/gpt-3.5-turbo",
        "messages": [
@@ -233,6 +242,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ```bash
 curl -X POST "http://localhost:8000/v1/chat/completions" \
      -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $OPENAI_API_KEY" \
      -d '{
        "model": "openai/gpt-3.5-turbo",
        "messages": [
@@ -247,6 +257,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ```bash
 curl -X POST "http://localhost:8000/v1/chat/completions" \
      -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $ANTHROPIC_API_KEY" \
      -d '{
        "model": "claude/claude-3-haiku-20240307",
        "messages": [
@@ -262,6 +273,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ```bash
 curl -X POST "http://localhost:8000/v1/chat/completions" \
      -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $GOOGLE_API_KEY" \
      -d '{
        "model": "gemini/gemini-1.5-flash-latest",
        "messages": [
@@ -277,6 +289,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ```bash
 curl -X POST "http://localhost:8000/v1/chat/completions" \
      -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
      -d '{
        "model": "deepseek/deepseek-chat",
        "messages": [
@@ -290,6 +303,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ```bash
 curl -X POST "http://localhost:8000/v1/chat/completions" \
      -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $MINMAX_API_KEY" \
      -d '{
        "model": "minmax/abab6-chat",
        "messages": [
@@ -305,6 +319,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ```bash
 curl -X POST "http://localhost:8000/v1/chat/completions" \
      -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $OLLAMA_API_KEY" \
      -d '{
        "model": "ollama/llama3",
        "messages": [
@@ -319,6 +334,7 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 # 注意: 首次運行 Hugging Face 模型可能需要較長時間下載模型檔案
 curl -X POST "http://localhost:8000/v1/chat/completions" \
      -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $HF_TOKEN" \
      -d '{
        "model": "huggingface/meta-llama/Llama-3-8B-Instruct",
        "messages": [
@@ -401,7 +417,7 @@ import requests
 import json
 
 api_url = "http://localhost:8000/v1/chat/completions"
-headers = {"Content-Type": "application/json"}
+headers = {"Content-Type": "application/json", "Authorization": "Bearer $OPENAI_API_KEY"}
 
 model_name = "openai/gpt-3.5-turbo"
 # model_name = "claude/claude-3-haiku-20240307"
@@ -450,7 +466,7 @@ import json
 # from sseclient import SSEClient # 或者手動解析串流
 
 api_url = "http://localhost:8000/v1/chat/completions"
-headers = {"Content-Type": "application/json"}
+headers = {"Content-Type": "application/json", "Authorization": "Bearer $OPENAI_API_KEY"}
 
 model_name = "openai/gpt-3.5-turbo"
 # ... (其他模型選擇同上) ...
@@ -505,139 +521,52 @@ except requests.exceptions.RequestException as e:
 *   **速率限制**: 各雲端 LLM 服務均有其 API 呼叫速率限制。高頻率使用時請查閱對應供應商的文檔，並在客戶端實施適當的重試或節流機制。
 *   **服務可用性**: 若某一供應商服務暫時不可用，此閘道設計允許您相對輕鬆地切換到其他可用的模型供應商。
 
-## API金鑰驗證與使用記錄功能
+## API 金鑰驗證與管理功能
 
-本服務添加了API金鑰驗證和使用記錄的功能，增強了安全性和可追蹤性：
+本服務支援 API 金鑰驗證與管理，增強安全性與可追蹤性。
 
-### API金鑰驗證功能
+### 1. 啟用 API 金鑰驗證
 
-1. **啟用API金鑰驗證**：
-   - 在`.env`文件中設定`enable_check_apikey=True`
-   - 可選：在`api_keys_whitelist`中添加允許的API金鑰列表
+- 在 `.env` 檔案中設定：
+  ```env
+  ENABLE_CHECK_APIKEY=True
+  ```
+- 並於 `api_keys_whitelist` 變數中設定允許的 API 金鑰（多組以逗號分隔）。
+- 若啟用驗證但白名單為空，所有請求將被拒絕。
 
-2. **API金鑰格式**：
-   - 格式：`{用途}-{建立日期}-{6位的隨機字母和數字}`
-   - 範例：`AT0130-20240507-dg0933`
+### 2. API 金鑰格式與傳遞方式
 
-3. **使用方式**：
-   - 在API請求時，於 HTTP header 中包含 `Authorization` 欄位。
-   - 金鑰的格式應為 `Bearer YOUR_API_KEY`。
-   - 範例：`curl -H "Authorization: Bearer AT0130-20240507-dg0933" ...`
+- 金鑰格式建議：`{用途}-{建立日期}-{6位隨機字母或數字}`
+  - 例如：`AT0130-20240507-dg0933`
+- 請求時於 HTTP header 加入：
+  ```http
+  Authorization: Bearer AT0130-20240507-dg0933
+  ```
+- 若未提供金鑰、格式錯誤或金鑰無效，API 會回傳 401 或 403 錯誤。
 
-### 使用記錄功能
+### 3. API 金鑰管理
 
-啟用API金鑰驗證後，系統會自動記錄API使用情況：
+- 建議使用 `demo_web/admin.py` Streamlit 管理介面：
+  - 產生新金鑰（自動加入白名單並更新 .env）
+  - 啟用/停用/刪除金鑰
+  - 編輯金鑰描述
+- **請勿手動編輯 .env 的 api_keys_whitelist，避免設定不一致。**
 
-1. **記錄內容**：
-   - 請求時間
-   - 請求類型（embedding或chat）
-   - 使用模型
-   - 輸入/輸出摘要
-   - tokens使用量
+### 4. API 金鑰使用記錄
 
-2. **記錄位置**：
-   - 記錄檔案保存在`history_apikey/{API金鑰}/{日期}.txt`
-   - 日期格式為YYYYMMDD
+- 啟用驗證後，所有 API 請求會自動記錄於：
+  - `history_apikey/{API_KEY}/{YYYYMMDD}.txt`
+- 每筆記錄包含：
+  - 請求時間、請求類型、模型、API 金鑰後綴、token 使用量、輸入/輸出摘要、狀態碼等
+- 日誌格式範例：
+  ```
+  [2025-05-08 21:41:38], Type: chat_stream_completed, Model: openai/gpt-4.1-nano, APIKeySuffix: ...xk8c, PromptTokens: 12, CompletionTokens: 0, TotalTokens: 12, StatusCode: 200, Input: 寫一首宋詞, 形容美人., Output: 這裡是LLM回覆內容...
+  ```
+- 可用於後台統計、審計與查詢。
 
-3. **設定目錄**：
-   - 在`.env`文件中可通過`history_apikey_dir`設定記錄目錄
+### 5. 常見問題與注意事項
 
-## API金鑰管理頁面
-
-為了方便管理API金鑰，我們提供了一個基於Streamlit的管理頁面：
-
-### 主要功能
-
-1. **產生API金鑰**：
-   - 管理者輸入功能代碼（2-8個大寫字母或數字）
-   - 系統自動生成格式為 `{功能代碼}-{當前日期}-{6位隨機字符}` 的API金鑰
-   - 可添加描述說明金鑰用途、負責人等信息
-
-2. **API金鑰使用統計**：
-   - 顯示所有API金鑰的使用記錄和統計數據
-   - 包括：最近訪問時間、訪問次數、輸入/輸出tokens統計
-
-3. **API金鑰管理**：
-   - 停用/啟用API金鑰
-   - 刪除API金鑰及其使用記錄
-   - 更新API金鑰描述
-
-### 使用方法
-
-1. **啟動管理頁面**：
-   ```bash
-   cd demo_web
-   streamlit run admin.py
-   ```
-
-2. **登入頁面**：
-   - 默認密碼：`admin123`
-   - 生產環境建議修改密碼（在`admin.py`中的`ADMIN_PASSWORD`變量）
-
-3. **產生新API金鑰**：
-   - 在「產生新API金鑰」標籤頁輸入功能代碼和描述
-   - 點擊「產生API金鑰」按鈕生成新金鑰
-   - 系統會自動將金鑰添加到白名單並更新`.env`文件
-
-4. **管理現有API金鑰**：
-   - 在「API金鑰管理」標籤頁查看所有金鑰及使用統計
-   - 選擇特定金鑰進行停用/啟用/刪除操作
-   - 可更新金鑰描述
-
-## 問題修復
-
-### Gemini模型問題修復
-
-1. **非串流回應問題**：
-   - 修復了使用`stream=False`時出現的`'tuple' object has no attribute 'choices'`錯誤
-   - 增強了回應解析，支援不同類型的Gemini API回應結構
-
-2. **串流回應問題**：
-   - 修復了客戶端收到`peer closed connection without sending complete message body`錯誤
-   - 改進了串流回應機制，使用適當的HTTP標頭確保穩定傳輸
-   - 增加了完成標記的處理，確保客戶端能正確識別串流結束
-
-### 其他改進
-
-1. **錯誤處理**：
-   - 增強了錯誤捕獲和報告
-   - 添加了詳細日誌幫助診斷問題
-
-2. **效能優化**：
-   - 使用`asyncio.to_thread`處理阻塞操作
-   - 添加了微小延遲確保串流片段能被客戶端正確處理
-
-## API 金鑰驗證
-
-本服務支援 API 金鑰驗證機制，以控制對 API 端點的存取。
-
-### 啟用金鑰驗證
-
-若要啟用 API 金鑰驗證，請在您的 `.env` 檔案中進行以下設定：
-
-```env
-ENABLE_CHECK_APIKEY=True
-```
-
-如果 `ENABLE_CHECK_APIKEY` 設為 `False` (預設值) 或未在 `.env` 檔案中設定，則 API 金鑰驗證將被停用，所有請求都將被允許，無需檢查金鑰。
-
-當啟用驗證時，如果 `api_keys_whitelist` 環境變數為空或未設定，服務啟動時會打印警告，但仍會要求客戶端提供金鑰。有效的金鑰需要透過 `demo_web/admin.py` 管理介面設定。
-
-### API 金鑰管理
-
-API 金鑰的產生、管理 (包含啟用/停用/刪除金鑰) 以及白名單的維護，都是透過 `demo_web/admin.py` 提供的管理頁面進行。
-`admin.py` 應用程式會自動將所有目前已啟用的有效 API 金鑰更新到 `.env` 檔案中的 `api_keys_whitelist` 環境變數。
-**強烈建議不要手動修改 `.env` 檔案中的 `api_keys_whitelist` 變數**，應全部透過 `admin.py` 管理介面操作，以確保設定的一致性。
-
-### 如何在請求中提供 API 金鑰
-
-當 API 金鑰驗證啟用時，所有向受保護端點 (目前為 `/v1/embeddings` 和 `/v1/chat/completions`) 發出的請求都必須在 HTTP header 中包含 `Authorization` 欄位，並提供有效的 API 金鑰。
-金鑰的格式應為 `Bearer YOUR_API_KEY`。
-
-**範例 Header:**
-```http
-Authorization: Bearer MYPREFIX-20230101-abcdef
-```
-其中 `MYPREFIX-20230101-abcdef` 是您透過 `admin.py` 產生的有效 API 金鑰。
-
-如果請求未提供 API 金鑰，或者提供的金鑰格式不正確、金鑰無效 (不在白名單中或已被停用)，API 將回傳相應的 HTTP 錯誤，通常是 `401 Unauthorized` (未授權) 或 `403 Forbidden` (禁止存取)。請檢查服務端的日誌以獲取更詳細的錯誤資訊。 
+- API 金鑰驗證預設關閉，需手動啟用。
+- 金鑰管理建議全程透過 admin.py 操作。
+- 若遇到驗證失敗，請檢查 .env 變數大小寫、金鑰是否在白名單、服務是否重啟。
+- 日誌目錄權限需正確，否則無法寫入記錄。 
