@@ -618,111 +618,106 @@ async def stream_chat_completion_gemini(request: ChatCompletionRequest):
         raise HTTPException(status_code=500, detail="未設定 Google API 金鑰")
     
     try:
-        # 移除 'gemini/' 前綴並加上 'models/' 前綴
+        # 確保引入所需模組
+        import google.generativeai as genai_lib
+        from google.genai import types
+        
+        # 移除 'gemini/' 前綴並加上 'models/' 前綴（如果需要）
         model_name = request.model.replace('gemini/', '')
         if not model_name.startswith('models/'):
             model_name = f"models/{model_name}"
         
         print(f"使用 Gemini 串流模型: {model_name}")
         
-        # 開始串流回應
-        async def generate():
+        # 使用自定義生成器來確保立即發送每個串流片段
+        async def generate_with_immediate_yield():
             try:
-                # 從請求中提取系統指令
+                # 處理請求訊息
+                formatted_messages = []
                 system_instruction = None
-                user_messages = []
                 
                 for msg in request.messages:
                     if msg.role == "system":
                         system_instruction = msg.content
-                    else:
-                        user_messages.append(msg)
-                
-                # 準備消息格式 (僅包含用戶和助手消息)
-                formatted_messages = []
-                for msg in user_messages:
-                    if msg.role == "user":
+                    elif msg.role == "user":
                         formatted_messages.append({"role": "user", "parts": [{"text": msg.content}]})
                     elif msg.role == "assistant":
                         formatted_messages.append({"role": "model", "parts": [{"text": msg.content}]})
                 
-                from google.genai import types
-                stream_generation_config_obj = types.GenerateContentConfig(
-                    temperature=request.temperature,
-                    system_instruction=system_instruction if system_instruction else None,
+                print(f"系統指令: {system_instruction}")
+                print(f"訊息數量: {len(formatted_messages)}")
+                
+                # 建立不包含 stream 參數的配置對象
+                config = types.GenerateContentConfig(
+                    temperature=request.temperature
                 )
                 
-                try:
-                    print("使用串流模式生成回應 (generate_content_stream)")
-                    response_iterator = await asyncio.to_thread(
-                        client.models.generate_content_stream,
-                        model=model_name,
-                        contents=formatted_messages,
-                        config=stream_generation_config_obj
-                    )
-                    
-                    # 處理串流回應 - generate_content_stream 應該直接產生增量
-                    for chunk in response_iterator: # 改為同步 for 迴圈
-                        if hasattr(chunk, 'text') and chunk.text:
-                            response_data = {
-                                'choices': [{
-                                    'delta': {
-                                        'content': chunk.text 
-                                    }
-                                }]
-                            }
-                            yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                if system_instruction:
+                    config.system_instruction = system_instruction
                 
-                except AttributeError as e:
-                    print(f"串流API (generate_content_stream) 不可用 ({e})，使用替代方法 (generate_content with stream=True)")
-                    
-                    fallback_config_dict = {
-                        "temperature": request.temperature,
-                        "stream": True 
-                    }
-                    if system_instruction:
-                        fallback_config_dict["system_instruction"] = system_instruction
-                    
-                    response_iterator = await asyncio.to_thread(
-                        client.models.generate_content,
-                        model=model_name,
-                        contents=formatted_messages,
-                        config=fallback_config_dict 
-                    )
-                    
-                    accumulated_text = ""
-                    for chunk in response_iterator: # 此處已為同步 for 迴圈
-                        if hasattr(chunk, 'text') and chunk.text:
-                            if len(chunk.text) > len(accumulated_text):
-                                delta_text = chunk.text[len(accumulated_text):]
-                                accumulated_text = chunk.text
-                                
-                                response_data = {
-                                    'choices': [{
-                                        'delta': {
-                                            'content': delta_text
-                                        }
-                                    }]
+                if request.max_tokens:
+                    config.max_output_tokens = request.max_tokens
+                
+                # 使用 generate_content_stream 方法
+                print("使用 client.models.generate_content_stream 進行真實串流")
+                
+                # 使用示例代碼中的方式，直接採用 generate_content_stream
+                response_stream = await asyncio.to_thread(
+                    client.models.generate_content_stream,
+                    model=model_name,
+                    contents=formatted_messages,
+                    config=config
+                )
+                
+                # 處理串流回應，確保每個片段立即發送
+                print("開始處理串流回應並立即發送片段")
+                for chunk in response_stream:
+                    if hasattr(chunk, 'text') and chunk.text and chunk.text.strip():
+                        print(f"獲取片段: {chunk.text}")
+                        response_data = {
+                            'choices': [{
+                                'delta': {
+                                    'content': chunk.text
                                 }
-                                yield f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
-                                await asyncio.sleep(0.01)  
+                            }]
+                        }
+                        data = f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
+                        print(f"發送片段: {len(data)} 字節")
+                        yield data
+                        # 加入小延遲確保客戶端有時間處理
+                        await asyncio.sleep(0.01)
                 
+                # 發送結束標記
+                print("發送 [DONE] 標記")
                 yield "data: [DONE]\n\n"
+                
             except Exception as e:
                 error_msg = f"Gemini 串流處理錯誤: {str(e)}"
                 print(error_msg)
-                raise HTTPException(status_code=500, detail=error_msg)
+                import traceback
+                traceback.print_exc()
+                # 在錯誤時也發送 [DONE] 信號
+                yield f"data: {{\"error\": \"{error_msg}\"}}\n\n"
+                yield "data: [DONE]\n\n"
         
+        # 返回串流響應，使用特殊設定確保即時發送
         return StreamingResponse(
-            generate(),
+            generate_with_immediate_yield(),
             media_type="text/event-stream",
-            headers={"Content-Type": "text/event-stream; charset=utf-8"}
+            headers={
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"  # 禁用 Nginx 緩衝
+            }
         )
         
     except HTTPException:
         raise
     except Exception as e:
         print(f"Gemini API 串流處理請求時發生意外錯誤: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Gemini API 錯誤: {str(e)}")
 
 async def stream_chat_completion_ollama(request: ChatCompletionRequest):
