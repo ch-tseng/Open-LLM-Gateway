@@ -36,14 +36,14 @@
 
 ### 2.2 安裝步驟
 1. **複製專案**：
-   將 `main.py`, `requirements.txt`, `README.md` 和 (可選的) `.env.example` (需自行複製為 `.env`) 檔案放在您的專案目錄中。
+   將 `main.py`, `requirements.txt`, `README.md` 和 (可選的) `env.example` (需自行複製為 `.env`) 檔案放在您的專案目錄中。
 2. **安裝依賴**：
    ```bash
    pip install -r requirements.txt
    ```
 
 ### 2.3 API 金鑰設定
-將 `.env.example` 檔案複製一份並重新命名為 `.env`。然後，在 `.env` 檔案中設定您需要使用的服務的 API 金鑰及相關配置：
+將 `env.example` 檔案複製一份並重新命名為 `.env`。然後，在 `.env` 檔案中設定您需要使用的服務的 API 金鑰及相關配置：
 
 ```env
 # OpenAI API 設定
