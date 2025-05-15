@@ -20,11 +20,11 @@ DEFAULT_MODELS = {
     "gemini": ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash", "gemini-2.5-flash-preview-04-17", "gemini-2.5-pro-preview-05-06", "gemini-1.0-pro"],
     "deepseek": ["deepseek-chat"],
     "minmax": ["minimax-text-01", "abab6.5s-chat"],
-    "ollama": ["qwen3:8b", "gemma3:12b"],
+    "ollama": ["qwen3:8b", "deepseek-r1:14b", "gemma3:12b", "phi4-reasoning", "granite3.3:8b"],
     "huggingface": ["meta-llama/Llama-3-8b-chat", "meta-llama/Llama-3-70b-chat", "mistralai/Mistral-7B-Instruct-v0.2", "google/gemma-7b-it", "microsoft/phi-3-medium-4k-instruct"]
 }
 
-DEFAULT_API_ENDPOINT = "http://172.30.11.15:8000"
+DEFAULT_API_ENDPOINT = "http://llm-gateway.sunplusit.com:8000"
 API_KEY = "AT0130-20250508-kbxk8c"
 
 # 載入配置 - 簡化為直接使用默認值
@@ -97,7 +97,7 @@ with st.sidebar:
     # LLM供應商選擇
     st.subheader("LLM供應商選擇")
     vendor = st.selectbox(
-        "選擇LLM供應商",
+        "LLM供應商(Ollama為免費的",
         options=["openai", "claude", "gemini", "deepseek", "minmax", "ollama", "huggingface"],
         index=["openai", "claude", "gemini", "deepseek", "minmax", "ollama", "huggingface"].index(st.session_state.selected_vendor)
     )
@@ -242,11 +242,13 @@ def send_stream_request(prompt):
                 return f"錯誤狀態碼: {e.response.status_code}, 錯誤內容: {e.response.text}"
         return error_message
 
+
 # 聊天輸入
 if prompt := st.chat_input("輸入您的訊息..."):
     # 添加用戶訊息
     st.session_state.messages.append({"role": "user", "content": prompt})
-    
+    st.session_state.messages.append({"role": "system", "content": "你要用繁體中文來生成回覆內容"})
+
     # 顯示用戶訊息
     with st.chat_message("user"):
         st.write(prompt)
