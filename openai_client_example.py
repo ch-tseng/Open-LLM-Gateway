@@ -34,12 +34,12 @@ from openai import APIError # 引入 APIError 以便更精確地捕捉錯誤
 
 # 您的 Open LLM Gateway 的 `/v1` API 端點 URL
 # 例如：如果您在本機運行 Gateway 且端口為 8000，則通常是 "http://localhost:8000/v1"
-OPENLLM_GATEWAY_BASE_URL = "http://llm-gateway.sunplusit.com:8000/v1"
+OPENLLM_GATEWAY_BASE_URL = "http://localhost:8000/v1"
 
 # 您的 API 金鑰
 # - 若 Gateway 啟用金鑰檢查，請填寫白名單中的金鑰。
 # - 若 Gateway 未啟用金鑰檢查，可填寫任意非空字串 (例如："not_needed")。
-OPENLLM_GATEWAY_API_KEY = "AT0130-20250508-kbxk8c"  # <--- 請務必替換成您的 API 金鑰或適用字串
+OPENLLM_GATEWAY_API_KEY = "DEFAULT-20250508-kbxk8c"  # <--- 請務必替換成您的 API 金鑰或適用字串
 
 # 範例中使用的聊天模型名稱
 # 請確保此模型已在您的 Gateway 中設定並可用。
@@ -51,9 +51,8 @@ CHAT_MODEL_NAME = "claude/claude-3-7-sonnet-latest"
 # 範例中使用的文本嵌入模型名稱
 # 請確保此模型已在您的 Gateway 中設定並可用。
 # EMBEDDING_MODEL_NAME = "ollama/bge-m3:latest"
-# EMBEDDING_MODEL_NAME = "openai/text-embedding-3-small"
+EMBEDDING_MODEL_NAME = "openai/text-embedding-3-small"
 # EMBEDDING_MODEL_NAME = "gemini/embedding-001"
-EMBEDDING_MODEL_NAME = "claude/voyage-3"
 
 # --- 初始化 OpenAI 客戶端 ---
 # 設定 base_url 以指向您的 Open LLM Gateway，並提供 API 金鑰。
@@ -218,7 +217,7 @@ if __name__ == "__main__":
     print("Open LLM Gateway - OpenAI 客戶端範例腳本")
     print("=" * 50)
 
-    if OPENLLM_GATEWAY_API_KEY == "AT0130-20250508-kbxk8c": # 這裡用您實際填寫的預設金鑰或提示替換
+    if OPENLLM_GATEWAY_API_KEY == "DEFAULT-20250508-kbxk8c": # 這裡用您實際填寫的預設金鑰或提示替換
         print("提示：目前使用的是預設的 API 金鑰。")
         print("請確保此金鑰對於您的 Gateway 設定是有效的，或者根據您的 Gateway 安全設定進行相應的修改。")
         print("如果您的 Gateway 未啟用金鑰檢查，目前的設定應該可以運作。")
