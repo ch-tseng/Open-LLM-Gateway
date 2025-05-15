@@ -18,6 +18,26 @@ import asyncio
 import datetime # Add datetime
 import atexit # Add atexit
 
+# --- API 金鑰驗證依賴動態切換 ---
+def always_allow():
+    return True
+
+def verify_api_key(authorization: str = Header(None)):
+    whitelist = os.getenv("api_keys_whitelist", "")
+    whitelist_set = {k.strip() for k in whitelist.split(",") if k.strip()}
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="缺少或格式錯誤的 API 金鑰")
+    token = authorization.replace("Bearer ", "").strip()
+    if token not in whitelist_set:
+        raise HTTPException(status_code=401, detail="API 金鑰無效")
+    return True
+
+# 載入 .env 檔案（只需要一次）
+load_dotenv(override=True) # Moved here, to be before getenv calls for ENABLE_CHECK_APIKEY
+
+ENABLE_CHECK_APIKEY = os.getenv("ENABLE_CHECK_APIKEY", "False").lower() == "true"
+api_key_dependency = Depends(verify_api_key) if ENABLE_CHECK_APIKEY else Depends(always_allow)
+
 # --- Pydantic 模型定義 ---
 
 class Usage(BaseModel):
@@ -111,240 +131,39 @@ class ChatCompletionResponse(BaseModel):
     usage: Usage
 
 # --- 環境變數與設定 (增加) ---
-load_dotenv() # 可選
-
-# 載入 .env 檔案（只需要一次）
-load_dotenv()
+# load_dotenv() # 已移到 API 金鑰驗證邏輯之前
 
 # --- API 金鑰驗證相關 (新增) ---
-ENABLE_CHECK_APIKEY = os.getenv("ENABLE_CHECK_APIKEY", "False").lower() == "true"
-API_KEYS_WHITELIST_STR = os.getenv("api_keys_whitelist", "")
-API_KEYS_WHITELIST = {key.strip() for key in API_KEYS_WHITELIST_STR.split(',') if key.strip()}
+# ENABLE_CHECK_APIKEY = os.getenv("ENABLE_CHECK_APIKEY", "False").lower() == "true" # 已移到前面
+# API_KEYS_WHITELIST_STR = os.getenv("api_keys_whitelist", "") # 相關邏輯已整合到 verify_api_key
+# API_KEYS_WHITELIST = {key.strip() for key in API_KEYS_WHITELIST_STR.split(',') if key.strip()} # 相關邏輯已整合到 verify_api_key
 
 # 讀取API金鑰白名單的路徑
 API_KEYS_PATH = os.path.join(os.path.dirname(__file__), "history_apikey", "api_keys.json")
 
-# 讀取API金鑰白名單
-def load_api_keys_whitelist():
-    """從api_keys.json檔案讀取API金鑰白名單"""
-    whitelist_from_env = {key.strip() for key in API_KEYS_WHITELIST_STR.split(',') if key.strip()}
-    
-    try:
-        if os.path.exists(API_KEYS_PATH):
-            with open(API_KEYS_PATH, 'r', encoding='utf-8') as f:
-                api_keys_data = json.load(f)
-                # 只添加未被停用的API金鑰（不包含_disabled後綴）
-                whitelist_from_file = {key for key in api_keys_data.keys() if not key.endswith("_disabled")}
-                whitelist = whitelist_from_env.union(whitelist_from_file)
-                return whitelist
-    except Exception as e:
-        print(f"讀取API金鑰白名單時發生錯誤: {e}")
-    
-    return whitelist_from_env
-
-# --- 日誌記錄相關 (新增) ---
-HISTORY_APIKEY_DIR = os.getenv("HISTORY_APIKEY_DIR", os.path.join(os.path.dirname(__file__), "history_apikey")) # Removed ".."
-LOG_FILE_HANDLERS = {} # To store open file handlers
-
-def get_log_file_path(api_key: str) -> Optional[str]:
-    if not api_key:
-        return None
-    try:
-        key_log_dir = os.path.join(HISTORY_APIKEY_DIR, api_key)
-        os.makedirs(key_log_dir, exist_ok=True)
-        date_str = datetime.datetime.now().strftime("%Y%m%d")
-        return os.path.join(key_log_dir, f"{date_str}.txt")
-    except Exception as e:
-        print(f"Error creating log directory for API key {api_key}: {e}")
-        return None
-
-def get_file_handler(file_path: str):
-    if file_path not in LOG_FILE_HANDLERS:
-        try:
-            LOG_FILE_HANDLERS[file_path] = open(file_path, "a", encoding="utf-8")
-        except Exception as e:
-            print(f"Error opening log file {file_path}: {e}")
-            return None
-    return LOG_FILE_HANDLERS[file_path]
-
-def close_all_log_files():
-    print("Closing all open log files...")
-    for handler in LOG_FILE_HANDLERS.values():
-        try:
-            handler.close()
-        except Exception as e:
-            print(f"Error closing a log file: {e}")
-    LOG_FILE_HANDLERS.clear()
-
-atexit.register(close_all_log_files) # Register cleanup function
-
-def log_api_usage(
-    api_key: str,
-    request_type: str, # "embedding" or "chat"
-    model_name: str,
-    prompt_tokens: int = 0,
-    completion_tokens: int = 0,
-    total_tokens: int = 0,
-    input_summary: Optional[str] = None,
-    output_summary: Optional[str] = None,
-    status_code: int = 200,
-    error_message: Optional[str] = None
-):
-    if not api_key or not ENABLE_CHECK_APIKEY: # Only log if API key check is enabled and key is present
-        return
-
-    log_file_path = get_log_file_path(api_key)
-    if not log_file_path:
-        return
-
-    handler = get_file_handler(log_file_path)
-    if not handler:
-        return
-
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry_parts = [
-        f"[{timestamp}]",
-        f"Type: {request_type}",
-        f"Model: {model_name}",
-        f"APIKeySuffix: ...{api_key[-4:]}", # Log only suffix for brevity/security
-        f"PromptTokens: {prompt_tokens}",
-        f"CompletionTokens: {completion_tokens}",
-        f"TotalTokens: {total_tokens}", # admin.py looks for "Tokens: sum" for now, this will need adjustment
-        f"StatusCode: {status_code}",
-    ]
-    if input_summary:
-        log_entry_parts.append(f"Input: {input_summary[:100].replace(chr(10), ' ')}") # Limit length and remove newlines
-    if output_summary:
-        log_entry_parts.append(f"Output: {output_summary[:100].replace(chr(10), ' ')}")
-    if error_message:
-        log_entry_parts.append(f"Error: {error_message[:100].replace(chr(10), ' ')}")
-
-    log_entry = ", ".join(log_entry_parts) + "\\n"
-
-    try:
-        abs_log_path = os.path.abspath(log_file_path)
-        print(f"DEBUG: Attempting to write to log file (Absolute Path): {abs_log_path}") # <--- 修改：打印絕對路徑
-        print(f"DEBUG: Log entry content (first 100 chars): {log_entry[:100]}") 
-        handler.write(log_entry)
-        handler.flush() # Ensure it's written to disk
-        print(f"DEBUG: Successfully wrote to log file (Absolute Path): {abs_log_path}") # <--- 修改：打印絕對路徑
-    except Exception as e:
-        print(f"Error writing to log file {log_file_path}: {e}")
-
-
-async def get_api_key_from_request(request: Request) -> Optional[str]:
-    if not ENABLE_CHECK_APIKEY:
-        return "logging_disabled_or_no_key_needed" # Return a placeholder if logging is effectively off for this request path
-
-    authorization: Optional[str] = request.headers.get("Authorization")
-    if authorization:
-        parts = authorization.split()
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            token = parts[1]
-            # 動態讀取最新的API金鑰白名單
-            current_whitelist = load_api_keys_whitelist()
-            if token in current_whitelist:
-                return token
-    return None
-
-
-if ENABLE_CHECK_APIKEY:
-    print("INFO: API 金鑰檢查已啟用。")
-    if not API_KEYS_WHITELIST:
-        print("警告：API 金鑰檢查已啟用，但 api_keys_whitelist 為空。所有需要金鑰的請求都可能被拒絕，除非白名單被正確設定。")
-    else:
-        # 為安全起見，不在日誌中打印整個白名單，只打印數量或部分信息
-        print(f"INFO: 已載入 {len(API_KEYS_WHITELIST)} 個 API 金鑰到白名單。")
-else:
-    print("INFO: API 金鑰檢查已停用。")
-
-async def verify_api_key(request: Request, authorization: Optional[str] = Header(None)):
-    """
-    驗證 API 金鑰。作為 FastAPI 依賴項使用。
-    """
-    if not ENABLE_CHECK_APIKEY:
-        return # 如果未啟用檢查，則直接通過
-
-    if not authorization:
-        print("DEBUG: 驗證失敗 - 未提供 Authorization header。")
-        raise HTTPException(
-            status_code=401,
-            detail="未提供 API 金鑰。請在 'Authorization' header 中提供金鑰 (格式: 'Bearer YOUR_API_KEY')。"
-        )
-
-    parts = authorization.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        print(f"DEBUG: 驗證失敗 - Authorization header 格式錯誤: {authorization}")
-        raise HTTPException(
-            status_code=401,
-            detail="API 金鑰格式錯誤。應為 'Bearer YOUR_API_KEY'。"
-        )
-
-    token = parts[1]
-    # Store the validated API key in request state to be retrieved by logging function
-    request.state.api_key = token
-    
-    # 動態讀取最新的API金鑰白名單
-    current_whitelist = load_api_keys_whitelist()
-    
-    if token not in current_whitelist:
-        # 為安全起見，不在日誌中記錄嘗試失敗的 token，或只記錄部分 hash
-        print(f"DEBUG: 驗證失敗 - API 金鑰 '{token[:4]}...' 不在白名單中。")
-        raise HTTPException(
-            status_code=403,
-            detail="提供的 API 金鑰無效或沒有權限。"
-        )
-
-    print(f"DEBUG: API 金鑰 '{token[:4]}...' 驗證成功。")
-    # 此處不需要回傳值，如果沒有拋出 HTTPException，FastAPI 會認為依賴項已滿足
-    return
-
 # 讀取所有環境變數
-OPENAI_API_KEY = os.getenv("openai_api")
-GOOGLE_API_KEY = os.getenv("gemini_api")
-OLLAMA_URL = os.getenv("ollama_baseurl")
-OLLAMA_API_KEY = os.getenv("ollama_api")
-OLLAMA_TIMEOUT = int(os.getenv("ollama_timeout", "120"))
-DEEPSEEK_API_KEY = os.getenv("deepseek_api")
-DEEPSEEK_API_URL = os.getenv("deepseek_api_url", "https://api.deepseek.com") # For streaming base
-DEEPSEEK_API_ENDPOINT_NONSTREAM = os.getenv("DEEPSEEK_API_ENDPOINT_NONSTREAM", "https://api.deepseek.com/chat/completions") # For non-streaming full endpoint
-MINMAX_API_KEY = os.getenv("minmax_api")
-MINMAX_API_URL = os.getenv("minmax_baseurl", "https://api.minimax.chat/v1/text/chatcompletion_v2")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY") # New key for Claude
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # 修改為正確的環境變數名稱
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # 修改為正確的環境變數名稱
+OLLAMA_URL = os.getenv("OLLAMA_URL")  # 修改為正確的環境變數名稱
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")  # 修改為正確的環境變數名稱
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")  # 修改為正確的環境變數名稱
+DEEPSEEK_API_URL = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com")
+DEEPSEEK_API_ENDPOINT_NONSTREAM = os.getenv("DEEPSEEK_API_ENDPOINT_NONSTREAM", "https://api.deepseek.com/chat/completions")
+MINMAX_API_KEY = os.getenv("MINMAX_API_KEY")  # 修改為正確的環境變數名稱
+MINMAX_API_URL = os.getenv("MINMAX_API_URL", "https://api.minimax.chat/v1/text/chatcompletion_v2")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # 設定 OpenAI 和 Google 的環境變數（如果需要）
 if OPENAI_API_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-if GOOGLE_API_KEY:
-    os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
-'''
-# 使用環境變數
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-OLLAMA_URL = os.getenv("ollama_baseurl")  # 直接使用 .env 中的完整 URL
-OLLAMA_API_KEY = os.getenv("ollama_api")  # 從 .env 讀取 API 金鑰
-OLLAMA_TIMEOUT = int(os.getenv("ollama_timeout", "120"))  # 預設 120 秒
-
-# 設定 DeepSeek 的環境變數
-DEEPSEEK_API_KEY = os.getenv("deepseek_api")
-DEEPSEEK_API_URL = os.getenv("deepseek_api_url", "https://api.deepseek.com")
-'''
-# 設定 OpenAI 用戶端 (如果金鑰存在)
-if OPENAI_API_KEY:
-    # 使用 v1.x API，不需要手動設定 openai.api_key
-    # client = OpenAI() 會自動讀取環境變數
-    pass # 不需額外設定
+    print(f"已設定 OpenAI API 金鑰: {OPENAI_API_KEY[:5]}***")
 else:
     print("警告：未找到 OPENAI_API_KEY 環境變數。將無法使用 OpenAI 模型。")
 
-# 設定 Google GenAI 用戶端 (如果金鑰存在)
 if GOOGLE_API_KEY:
-    # 使用新版 Client API
-    try:
-        client = genai.Client(api_key=GOOGLE_API_KEY)
-        print(f"Google GenAI 客戶端初始化成功，使用 API 金鑰: {GOOGLE_API_KEY[:5]}***")
-    except Exception as e:
-        print(f"警告：初始化 Google GenAI 客戶端發生錯誤: {e}")
+    os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
+    print(f"已設定 Google API 金鑰: {GOOGLE_API_KEY[:5]}***")
 else:
     print("警告：未找到 GOOGLE_API_KEY 環境變數。將無法使用 Google Gemini 模型。")
 
@@ -360,25 +179,26 @@ if OLLAMA_URL:
         else:
             base_url = OLLAMA_URL
             print(f"Ollama 服務 URL: {base_url}")
-        
-        # 測試 Ollama API 是否可用
-        try:
-            test_url = f"{base_url}/api/tags"
-            print(f"正在測試 Ollama API 連接性: {test_url}")
-            response = requests.get(test_url)
-            if response.status_code == 200:
-                print("Ollama API 可用！")
-                models = response.json().get("models", [])
-                model_names = [model.get("name") for model in models] if models else []
-                print(f"已安裝的模型: {model_names}")
-            else:
-                print(f"警告: Ollama API 回應代碼 {response.status_code}: {response.text}")
-        except Exception as e:
-            print(f"警告: 無法連接到 Ollama API: {str(e)}")
     else:
         print(f"警告: Ollama URL 格式不正確 (應以 http:// 或 https:// 開頭): {OLLAMA_URL}")
 else:
-    print("警告：未找到 ollama_url 環境變數。將無法使用 Ollama 模型。")
+    print("警告：未找到 OLLAMA_URL 環境變數。將無法使用 Ollama 模型。")
+
+# 檢查其他 API 金鑰
+if DEEPSEEK_API_KEY:
+    print(f"已設定 DeepSeek API 金鑰: {DEEPSEEK_API_KEY[:5]}***")
+else:
+    print("警告：未找到 DEEPSEEK_API_KEY 環境變數。將無法使用 DeepSeek 模型。")
+
+if MINMAX_API_KEY:
+    print(f"已設定 MinMax API 金鑰: {MINMAX_API_KEY[:5]}***")
+else:
+    print("警告：未找到 MINMAX_API_KEY 環境變數。將無法使用 MinMax 模型。")
+
+if ANTHROPIC_API_KEY:
+    print(f"已設定 Anthropic API 金鑰: {ANTHROPIC_API_KEY[:5]}***")
+else:
+    print("警告：未找到 ANTHROPIC_API_KEY 環境變數。將無法使用 Claude 模型。")
 
 # --- 本地模型管理 (修改) ---
 # 不在啟動時載入特定模型，改為動態載入
@@ -437,7 +257,7 @@ app = FastAPI(
 # --- API 端點 (大幅修改) ---
 
 @app.post("/v1/embeddings", response_model=EmbeddingResponse)
-async def create_embedding(request_data: EmbeddingRequest, fastapi_request: Request, _authorized: bool = Depends(verify_api_key)):
+async def create_embedding(request_data: EmbeddingRequest, fastapi_request: Request, _authorized: bool = api_key_dependency):
     """
     根據請求的模型名稱，使用 Hugging Face、OpenAI 或 Google Gemini 產生 embedding。
     """
@@ -1515,7 +1335,7 @@ async def stream_chat_completion_huggingface(request: ChatCompletionRequest, api
 
 # --- API 端點 ---
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def create_chat_completion(request_data: ChatCompletionRequest, fastapi_request: Request, _authorized: bool = Depends(verify_api_key)):
+async def create_chat_completion(request_data: ChatCompletionRequest, fastapi_request: Request, _authorized: bool = api_key_dependency):
     """處理聊天完成請求"""
     api_key_for_logging = await get_api_key_from_request(fastapi_request)
     input_summary_for_logging = request_data.messages[-1].content if request_data.messages else "No input"
@@ -2325,3 +2145,22 @@ async def get_chat_completion_deepseek(request: ChatCompletionRequest) -> ChatCo
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"DeepSeek API (non-stream) 錯誤: {str(e_general)}")
+
+# --- API 金鑰驗證依賴動態切換 ---
+from fastapi import Depends, Header, HTTPException
+
+def always_allow():
+    return True
+
+def verify_api_key(authorization: str = Header(None)):
+    whitelist = os.getenv("api_keys_whitelist", "")
+    whitelist_set = {k.strip() for k in whitelist.split(",") if k.strip()}
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="缺少或格式錯誤的 API 金鑰")
+    token = authorization.replace("Bearer ", "").strip()
+    if token not in whitelist_set:
+        raise HTTPException(status_code=401, detail="API 金鑰無效")
+    return True
+
+ENABLE_CHECK_APIKEY = os.getenv("ENABLE_CHECK_APIKEY", "False").lower() == "true"
+api_key_dependency = Depends(verify_api_key) if ENABLE_CHECK_APIKEY else Depends(always_allow)

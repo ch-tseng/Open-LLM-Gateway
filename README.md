@@ -65,17 +65,20 @@ MINMAX_API_KEY=xxxxxxxxxxxxxxxx
 MINMAX_API_URL=https://api.minimax.chat/v1/text/chatcompletion_v2
 
 # Ollama 服務設定 (本地或遠端)
-OLLAMA_BASEURL=http://localhost:11434
+OLLAMA_URL=http://localhost:11434
 OLLAMA_API_KEY= # 如果您的 Ollama 服務需要 API 金鑰
 OLLAMA_TIMEOUT=120 # 秒
 
-# HuggingFace Token (可選，用於訪問私有模型或某些需要登入的模型)
-# HF_TOKEN=your_huggingface_token
+# API 金鑰驗證設定（可選）
+ENABLE_CHECK_APIKEY=False
+api_keys_whitelist=
 ```
 
 **注意事項**：
 - 您只需要設定您計劃使用的服務的 API 金鑰。
 - `DEEPSEEK_API_URL` 主要用於串流，`DEEPSEEK_API_ENDPOINT_NONSTREAM` 用於非串流。
+- `OLLAMA_URL` 請對應您的本地或遠端 Ollama 服務位址。
+- 若啟用 API 金鑰驗證，請將 `ENABLE_CHECK_APIKEY` 設為 `True`，並於 `api_keys_whitelist` 中填入允許的金鑰（多組以逗號分隔）。
 - 請務必保護好您的 API 金鑰，不要將包含真實金鑰的 `.env` 檔案提交到公開的版本控制系統。
 
 ### 2.4 啟動伺服器
