@@ -24,8 +24,8 @@ DEFAULT_MODELS = {
     "huggingface": ["meta-llama/Llama-3-8b-chat", "meta-llama/Llama-3-70b-chat", "mistralai/Mistral-7B-Instruct-v0.2", "google/gemma-7b-it", "microsoft/phi-3-medium-4k-instruct"]
 }
 
-DEFAULT_API_ENDPOINT = "http://llm-gateway.sunplusit.com:8000"
-API_KEY = "AT0130-20250508-kbxk8c"
+DEFAULT_API_ENDPOINT = "http://localhost:8000"
+API_KEY = "DEFAULT-20250508-kbxk8c"
 
 # 載入配置 - 簡化為直接使用默認值
 MODELS = DEFAULT_MODELS
