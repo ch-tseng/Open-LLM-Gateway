@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sentence_transformers import SentenceTransformer
 from typing import List, Union, Dict, Any, Optional
 import time
@@ -22,12 +22,48 @@ import atexit # Add atexit
 
 class Usage(BaseModel):
     prompt_tokens: int = 0
+    completion_tokens: Optional[int] = None
     total_tokens: int = 0
+
+    @model_validator(mode='after')
+    def calculate_missing_tokens(cls, data: Any) -> Any:
+        # data is the model instance itself in Pydantic v2 for 'after' validators
+        # No need to check isinstance(data, BaseModel) usually, but it's safer with Any
+        
+        # Ensure prompt_tokens and total_tokens are treated as 0 if None for calculation purposes,
+        # though their schema types are int, they might be set to None if coming from flexible dicts.
+        # However, here they are already int=0 by default.
+        prompt = data.prompt_tokens
+        completion = data.completion_tokens # This one is Optional[int]
+        total = data.total_tokens
+
+        # Scenario 1: Calculate completion_tokens if missing
+        if completion is None and total is not None and prompt is not None:
+            # We assume total_tokens and prompt_tokens are valid for subtraction
+            data.completion_tokens = total - prompt
+        
+        # Scenario 2: Calculate total_tokens if it's the default (0) or inconsistent
+        # and others are available
+        elif prompt is not None and completion is not None:
+            calculated_total = prompt + completion
+            # Update total_tokens if it's the default 0 or if it's inconsistent with sum
+            if data.total_tokens == 0 or data.total_tokens != calculated_total:
+                data.total_tokens = calculated_total
+        
+        # Scenario 3: (Less common) Calculate prompt_tokens if missing, and others are available
+        elif prompt is None and total is not None and completion is not None:
+             data.prompt_tokens = total - completion
+             # And re-ensure completion_tokens isn't None if it was just calculated based on a new prompt
+             if data.prompt_tokens == 0 and data.total_tokens == data.completion_tokens and data.completion_tokens is None : # Edge case if all were zero initially
+                 pass # Avoid issues if all are zero
+
+        return data
 
 class EmbeddingData(BaseModel):
     object: str = "embedding"
     embedding: List[float]
     index: int
+    usage: Usage
 
 class EmbeddingRequest(BaseModel):
     input: Union[str, List[str]]
@@ -46,20 +82,33 @@ class ChatMessage(BaseModel):
     role: str
     content: str
 
+class ChatCompletionRequestMessage(BaseModel): # <--- 更名以區分請求和回應
+    role: str
+    content: str
+
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: List[ChatMessage]
+    messages: List[ChatCompletionRequestMessage] # <--- 使用更名後的模型
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
     stream: Optional[bool] = False
+
+class ChatCompletionResponseMessage(BaseModel):
+    role: str
+    content: Union[str, None] = None # 允許 content 為 None
+
+class ChatCompletionChoice(BaseModel):
+    index: int = 0
+    message: ChatCompletionResponseMessage
+    finish_reason: Optional[str] = "stop"
 
 class ChatCompletionResponse(BaseModel):
     id: str
     object: str = "chat.completion"
     created: int
     model: str
-    choices: List[Dict[str, Any]]
-    usage: Dict[str, int]
+    choices: List[ChatCompletionChoice]
+    usage: Usage
 
 # --- 環境變數與設定 (增加) ---
 load_dotenv() # 可選
@@ -71,6 +120,27 @@ load_dotenv()
 ENABLE_CHECK_APIKEY = os.getenv("ENABLE_CHECK_APIKEY", "False").lower() == "true"
 API_KEYS_WHITELIST_STR = os.getenv("api_keys_whitelist", "")
 API_KEYS_WHITELIST = {key.strip() for key in API_KEYS_WHITELIST_STR.split(',') if key.strip()}
+
+# 讀取API金鑰白名單的路徑
+API_KEYS_PATH = os.path.join(os.path.dirname(__file__), "history_apikey", "api_keys.json")
+
+# 讀取API金鑰白名單
+def load_api_keys_whitelist():
+    """從api_keys.json檔案讀取API金鑰白名單"""
+    whitelist_from_env = {key.strip() for key in API_KEYS_WHITELIST_STR.split(',') if key.strip()}
+    
+    try:
+        if os.path.exists(API_KEYS_PATH):
+            with open(API_KEYS_PATH, 'r', encoding='utf-8') as f:
+                api_keys_data = json.load(f)
+                # 只添加未被停用的API金鑰（不包含_disabled後綴）
+                whitelist_from_file = {key for key in api_keys_data.keys() if not key.endswith("_disabled")}
+                whitelist = whitelist_from_env.union(whitelist_from_file)
+                return whitelist
+    except Exception as e:
+        print(f"讀取API金鑰白名單時發生錯誤: {e}")
+    
+    return whitelist_from_env
 
 # --- 日誌記錄相關 (新增) ---
 HISTORY_APIKEY_DIR = os.getenv("HISTORY_APIKEY_DIR", os.path.join(os.path.dirname(__file__), "history_apikey")) # Removed ".."
@@ -171,7 +241,9 @@ async def get_api_key_from_request(request: Request) -> Optional[str]:
         parts = authorization.split()
         if len(parts) == 2 and parts[0].lower() == "bearer":
             token = parts[1]
-            if token in API_KEYS_WHITELIST:
+            # 動態讀取最新的API金鑰白名單
+            current_whitelist = load_api_keys_whitelist()
+            if token in current_whitelist:
                 return token
     return None
 
@@ -211,7 +283,11 @@ async def verify_api_key(request: Request, authorization: Optional[str] = Header
     token = parts[1]
     # Store the validated API key in request state to be retrieved by logging function
     request.state.api_key = token
-    if token not in API_KEYS_WHITELIST:
+    
+    # 動態讀取最新的API金鑰白名單
+    current_whitelist = load_api_keys_whitelist()
+    
+    if token not in current_whitelist:
         # 為安全起見，不在日誌中記錄嘗試失敗的 token，或只記錄部分 hash
         print(f"DEBUG: 驗證失敗 - API 金鑰 '{token[:4]}...' 不在白名單中。")
         raise HTTPException(
@@ -241,7 +317,7 @@ if OPENAI_API_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 if GOOGLE_API_KEY:
     os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
-
+'''
 # 使用環境變數
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -252,7 +328,7 @@ OLLAMA_TIMEOUT = int(os.getenv("ollama_timeout", "120"))  # 預設 120 秒
 # 設定 DeepSeek 的環境變數
 DEEPSEEK_API_KEY = os.getenv("deepseek_api")
 DEEPSEEK_API_URL = os.getenv("deepseek_api_url", "https://api.deepseek.com")
-
+'''
 # 設定 OpenAI 用戶端 (如果金鑰存在)
 if OPENAI_API_KEY:
     # 使用 v1.x API，不需要手動設定 openai.api_key
@@ -381,26 +457,37 @@ async def create_embedding(request_data: EmbeddingRequest, fastapi_request: Requ
 
     try:
         # --- OpenAI 模型 ---
-        if requested_model.startswith("text-embedding-"):
+        if requested_model.startswith("text-embedding-") or requested_model.startswith("openai/text-embedding-"):
             if not OPENAI_API_KEY:
                 exc = HTTPException(status_code=500, detail="伺服器未設定 OpenAI API 金鑰 (OPENAI_API_KEY)。")
                 if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", requested_model, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=exc.detail)
                 raise exc
             try:
-                print(f"使用 OpenAI API，模型: {requested_model}")
+                openai_actual_model_name = requested_model
+                if openai_actual_model_name.startswith("openai/"):
+                    openai_actual_model_name = openai_actual_model_name.replace("openai/", "")
+
+                print(f"使用 OpenAI API，請求模型: {requested_model} (實際 OpenAI 模型: {openai_actual_model_name})")
                 # 使用 v1.x SDK
                 from openai import OpenAI, APIError
                 client = OpenAI() # 自動讀取 OPENAI_API_KEY
 
                 response = client.embeddings.create(
                     input=input_texts,
-                    model=requested_model
+                    model=openai_actual_model_name
                 )
                 # 提取數據
                 for i, data in enumerate(response.data):
                     response_data.append(EmbeddingData(embedding=data.embedding, index=data.index))
-                usage = Usage(prompt_tokens=response.usage.prompt_tokens, total_tokens=response.usage.total_tokens)
-                actual_model_name = response.model # 使用 OpenAI 回傳的精確模型名稱
+                
+                # OpenAI API v1.x SDK 的 response.usage 包含 prompt_tokens 和 total_tokens
+                # usage 的型別是 openai.types.CompletionUsage
+                prompt_tokens_val = response.usage.prompt_tokens if response.usage else 0
+                total_tokens_val = response.usage.total_tokens if response.usage else 0
+                
+                usage = Usage(prompt_tokens=prompt_tokens_val, total_tokens=total_tokens_val)
+                actual_model_name = requested_model # 回傳使用者請求的原始模型名稱 (包含 openai/ 前綴，如果有的話)
+                
                 if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", actual_model_name, prompt_tokens=usage.prompt_tokens, total_tokens=usage.total_tokens, input_summary=input_summary_for_logging)
 
             except APIError as e:
@@ -422,18 +509,23 @@ async def create_embedding(request_data: EmbeddingRequest, fastapi_request: Requ
         # --- Google Gemini 模型 ---
         elif requested_model.startswith("models/embedding-") or \
              requested_model.startswith("models/gemini-") or \
-             (requested_model.startswith("embedding-") and not requested_model.startswith("text-embedding-")) or \
-             requested_model.startswith("gemini-"):
+             requested_model.startswith("gemini/") or \
+             (requested_model.startswith("embedding-") and not requested_model.startswith("text-embedding-")):
 
             if not GOOGLE_API_KEY:
                 exc = HTTPException(status_code=500, detail="伺服器未設定 Google API 金鑰 (GOOGLE_API_KEY)。")
                 if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", requested_model, input_summary=input_summary_for_logging, status_code=exc.status_code, error_message=exc.detail)
                 raise exc
 
-            # 確保傳遞給 Google API 的模型名稱包含 "models/" 前綴
             google_api_model_name = requested_model
+            if google_api_model_name.startswith("gemini/"):
+                google_api_model_name = google_api_model_name.replace("gemini/", "")
+            
             if not google_api_model_name.startswith("models/"):
-                google_api_model_name = f"models/{google_api_model_name}"
+                 # Avoid adding models/ if it's already like embedding-001 (which doesn't take models/ prefix for genai typically)
+                if not google_api_model_name.startswith("embedding-"): # Specific check for common non-prefixed embedding models
+                    google_api_model_name = f"models/{google_api_model_name}"
+                # else: for models like "embedding-001", we use them as is. The SDK handles it.
 
             try:
                 print(f"使用 Google GenAI API，請求模型: {requested_model} (API 模型: {google_api_model_name})")
@@ -859,105 +951,164 @@ async def stream_chat_completion_openai(request: ChatCompletionRequest, api_key_
             )
 
 async def stream_chat_completion_gemini(request: ChatCompletionRequest, api_key_for_logging: Optional[str], input_summary_for_logging: Optional[str]):
-    model_name_for_log = request.model
+    model_name_for_log = request.model 
     full_assistant_response_for_log = ""
-    prompt_tokens_for_log = len(input_summary_for_logging) if input_summary_for_logging else 0
-    completion_tokens_for_log = 0
+    prompt_char_count_for_log = sum(len(m.content) for m in request.messages) if request.messages else 0
+    completion_char_count_for_log = 0
     error_for_log = None
     status_code_for_log = 200
 
     try:
         if not GOOGLE_API_KEY:
-            status_code_for_log = 500
             error_for_log = "未設定 Google API 金鑰"
-            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+            status_code_for_log = 500
+        elif client is None: # client 是全域 genai.Client() 實例
+            error_for_log = "Google GenAI 客戶端未初始化。"
+            status_code_for_log = 500
         
-        try:
-            import google.generativeai as genai_lib
-            from google.genai import types
+        if error_for_log:
+            # 如果在初始檢查中發現問題，則不繼續執行 API 呼叫邏輯
+            # 錯誤將在 finally 區塊中被記錄和拋出
+            pass # 允許執行流程到 finally
+        else:
+            # API 金鑰和 client 都有效，繼續執行
+            model_name_for_api = request.model.replace('gemini/', '')
+            if not model_name_for_api.startswith('models/'):
+                model_name_for_api = f"models/{model_name_for_api}"
             
-            model_name = request.model.replace('gemini/', '')
-            if not model_name.startswith('models/'):
-                model_name = f"models/{model_name}"
-            
-            print(f"使用 Gemini 串流模型: {model_name}")
-            
+            print(f"使用 Gemini 串流模型: {model_name_for_api}")
+
             async def generate_with_immediate_yield():
-                nonlocal full_assistant_response_for_log, completion_tokens_for_log, error_for_log, status_code_for_log
+                nonlocal full_assistant_response_for_log, completion_char_count_for_log, error_for_log, status_code_for_log
                 try:
-                    formatted_messages = []
-                    system_instruction = None
-                    
+                    system_instruction_text = None
+                    processed_messages_for_api = []
                     for msg in request.messages:
                         if msg.role == "system":
-                            system_instruction = msg.content
-                        elif msg.role == "user":
-                            formatted_messages.append({"role": "user", "parts": [{"text": msg.content}]})
-                        elif msg.role == "assistant":
-                            formatted_messages.append({"role": "model", "parts": [{"text": msg.content}]})
+                            if system_instruction_text is None: system_instruction_text = msg.content
+                            else: processed_messages_for_api.append({"role": "user", "parts": [{"text": f"(額外系統指示): {msg.content}"}]})
+                        else:
+                            api_role = "user" if msg.role == "user" else "model"
+                            processed_messages_for_api.append({"role": api_role, "parts": [{"text": msg.content}]})
                     
-                    config = types.GenerateContentConfig(temperature=request.temperature)
-                    if system_instruction: config.system_instruction = system_instruction
-                    if request.max_tokens: config.max_output_tokens = request.max_tokens
+                    final_contents_for_stream_api = []
+                    if system_instruction_text:
+                        final_contents_for_stream_api.append({"role": "user", "parts": [{"text": f"System Instruction: {system_instruction_text}\\n\\nUser Question/Input Below:"}]})
+                    final_contents_for_stream_api.extend(processed_messages_for_api)
+
+                    if not final_contents_for_stream_api or not any(part["role"] == "user" for part in final_contents_for_stream_api):
+                        final_contents_for_stream_api.append({"role": "user", "parts": [{"text": "(無用戶輸入，繼續執行)"}]})
+                        print("警告 (Gemini 串流): 處理後 messages 列表為空或無 user message，已添加預設 user message。")
+
+                    stream_api_params = {
+                        "model": model_name_for_api,
+                        "contents": final_contents_for_stream_api,
+                    }
+                    # 移除 temperature 和 max_output_tokens，因為舊版 SDK 不支援直接作為參數傳遞
+
+                    print(f"Gemini 串流 API 參數: {stream_api_params}")
                     
                     response_stream = await asyncio.to_thread(
                         client.models.generate_content_stream,
-                        model=model_name,
-                        contents=formatted_messages,
-                        config=config
+                        model=stream_api_params["model"], 
+                        contents=stream_api_params["contents"]
                     )
                     
+                    has_yielded_content = False
                     for chunk in response_stream:
-                        if hasattr(chunk, 'text') and chunk.text and chunk.text.strip():
-                            content_chunk = chunk.text
+                        # print(f"DEBUG Gemini stream chunk: {vars(chunk) if hasattr(chunk, '__dict__') else chunk}") # 再次註解掉，因為已確認 chunk 結構
+                        chunk_content_to_yield = None
+                        
+                        # 最常見的情況：直接從 chunk.text 獲取
+                        if hasattr(chunk, 'text') and chunk.text:
+                            chunk_content_to_yield = chunk.text
+                        # 其次，檢查 chunk.parts (這是 candidates[0].content.parts 的簡化訪問方式)
+                        elif hasattr(chunk, 'parts') and chunk.parts:
+                            temp_content_from_parts = ""
+                            for part in chunk.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    temp_content_from_parts += part.text
+                            if temp_content_from_parts:
+                                chunk_content_to_yield = temp_content_from_parts
+                        # 最詳細的檢查：遍歷 candidates -> content -> parts
+                        elif hasattr(chunk, 'candidates') and chunk.candidates:
+                            temp_content_from_candidates = ""
+                            for candidate in chunk.candidates:
+                                if hasattr(candidate, 'content') and candidate.content and \
+                                   hasattr(candidate.content, 'parts') and candidate.content.parts:
+                                    for part_item in candidate.content.parts:
+                                        if hasattr(part_item, 'text') and part_item.text:
+                                            temp_content_from_candidates += part_item.text
+                            if temp_content_from_candidates:
+                                chunk_content_to_yield = temp_content_from_candidates
+                        
+                        if chunk_content_to_yield:
+                            content_chunk = chunk_content_to_yield
                             full_assistant_response_for_log += content_chunk
                             response_data = {'choices': [{'delta': {'content': content_chunk}}]}
-                            data = f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n"
-                            yield data
-                            await asyncio.sleep(0.01)
-                    yield "data: [DONE]\n\n"
-                except Exception as e:
-                    error_for_log = f"Gemini 串流處理錯誤: {str(e)}"
-                    status_code_for_log = 500 # Or parse from e if possible
-                    print(error_for_log)
+                            data_to_yield = f"data: {json.dumps(response_data, ensure_ascii=False)}\n\n" # <<< 更正這裡
+                            yield data_to_yield
+                            has_yielded_content = True
+                            await asyncio.sleep(0.001)
+                    
+                    if not has_yielded_content and not error_for_log:
+                        print("Gemini stream: 未產生任何內容 chunk，但串流已無錯誤地完成。")
+
+                    yield "data: [DONE]\n\n" # <<< 更正這裡
+
+                except Exception as e_stream_inner:
+                    error_for_log = f"Gemini 串流處理內部錯誤 ({model_name_for_api}): {str(e_stream_inner)}"
+                    status_code_for_log = 500 
+                    print(f"Gemini 串流內部錯誤: {error_for_log}")
                     import traceback; traceback.print_exc()
-                    yield f"data: {json.dumps({'error': error_for_log, 'status_code': status_code_for_log}, ensure_ascii=False)}\n\n"
-                    yield "data: [DONE]\n\n"
+                    try:
+                        yield f"data: {json.dumps({'error': {'message': error_for_log, 'type': 'gemini_stream_error', 'code': status_code_for_log}}, ensure_ascii=False)}\n\n" # <<< 更正這裡
+                        yield "data: [DONE]\n\n" # <<< 更正這裡
+                    except Exception as e_yield_error:
+                        print(f"Gemini 串流: 回報錯誤時發生錯誤: {e_yield_error}")
                 finally:
-                    completion_tokens_for_log = len(full_assistant_response_for_log)
+                    completion_char_count_for_log = len(full_assistant_response_for_log)
             
-            return StreamingResponse(
-                generate_with_immediate_yield(),
-                media_type="text/event-stream",
-                headers={
-                    "Content-Type": "text/event-stream; charset=utf-8",
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no"
-                }
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            status_code_for_log = 500
-            error_for_log = f"Gemini API 串流設定錯誤: {str(e)}"
-            print(f"Gemini API 串流處理請求時發生意外錯誤: {e}")
-            import traceback; traceback.print_exc()
-            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
+            # 只有在初始檢查中沒有設定 error_for_log 時，才回傳 StreamingResponse
+            # (generate_with_immediate_yield 內部發生的錯誤由其自身處理並記錄到 error_for_log)
+            if not error_for_log:
+                return StreamingResponse(
+                    generate_with_immediate_yield(),
+                    media_type="text/event-stream",
+                    headers={"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
+                )
+            # 如果 error_for_log 在初始檢查時被設定 (例如 API key 問題)，控制流將轉到外層的 finally
+            # 在這種情況下，此函數不會回傳 StreamingResponse，而是依賴 finally 拋出 HTTPException
+    
+    # except Exception as e_outer_most_setup: # 這個 try-except 結構實際上已經包含在上面的 try 內部了
+    #     # 捕捉在 'else' 區塊之外的、更早期的設定錯誤
+    #     if not error_for_log: # 只有在還沒有特定錯誤時才更新
+    #         error_for_log = f"Gemini 串流最外層設定錯誤: {str(e_outer_most_setup)}"
+    #         status_code_for_log = 500
+    #         print(f"Gemini 串流最外層設定錯誤: {error_for_log}")
+    #         import traceback; traceback.print_exc()
+    # 這段 except 是多餘的，因為最外層的 try 已經捕捉了所有例外
+
     finally:
-        if api_key_for_logging:
-            log_api_usage(
-                api_key=api_key_for_logging,
-                request_type="chat_stream_completed",
-                model_name=model_name_for_log,
-                prompt_tokens=prompt_tokens_for_log,
-                completion_tokens=completion_tokens_for_log,
-                total_tokens=prompt_tokens_for_log + completion_tokens_for_log,
-                input_summary=input_summary_for_logging,
-                output_summary=full_assistant_response_for_log if full_assistant_response_for_log else None,
-                status_code=status_code_for_log,
-                error_message=error_for_log
-            )
+        # 無論成功或失敗，都記錄 API 使用情況
+        log_api_usage(
+            api_key=api_key_for_logging,
+            request_type="chat_stream_completed" if not error_for_log and status_code_for_log == 200 else "chat_stream_error",
+            model_name=model_name_for_log,
+            prompt_tokens=prompt_char_count_for_log, 
+            completion_tokens=completion_char_count_for_log, 
+            total_tokens=prompt_char_count_for_log + completion_char_count_for_log, 
+            input_summary=input_summary_for_logging,
+            output_summary=full_assistant_response_for_log if full_assistant_response_for_log else None,
+            status_code=status_code_for_log,
+            error_message=error_for_log
+        )
+        
+        # 如果在整個 try 區塊（包括初始檢查和 API 呼叫邏輯）中發生了錯誤，
+        # 並且這個錯誤應該導致 HTTP 錯誤回應，則在這裡拋出。
+        # 這確保了即使 StreamingResponse 沒有被 return (因為初始錯誤)，客戶端也會收到 HTTP 錯誤。
+        if error_for_log and status_code_for_log >= 400:
+            raise HTTPException(status_code=status_code_for_log, detail=error_for_log)
 
 async def stream_chat_completion_ollama(request: ChatCompletionRequest, api_key_for_logging: Optional[str], input_summary_for_logging: Optional[str]):
     model_name_for_log = request.model
@@ -1377,18 +1528,70 @@ async def create_chat_completion(request_data: ChatCompletionRequest, fastapi_re
                 # Here we log the initial request attempt
                 if api_key_for_logging: log_api_usage(api_key_for_logging, "chat_stream_attempt", request_data.model, input_summary=input_summary_for_logging)
                 return await stream_chat_completion_openai(request_data, api_key_for_logging, input_summary_for_logging)
-            else:
+            else: # OpenAI non-stream
                 response = await get_chat_completion_openai(request_data)
-                if api_key_for_logging and response: log_api_usage(api_key_for_logging, "chat", response.model, prompt_tokens=response.usage.get("prompt_tokens",0), completion_tokens=response.usage.get("completion_tokens",0), total_tokens=response.usage.get("total_tokens",0), input_summary=input_summary_for_logging, output_summary=response.choices[0].message.content if response.choices else None)
+                if api_key_for_logging and response:
+                    output_summary_val = None
+                    prompt_tokens_val = 0
+                    completion_tokens_val = 0
+                    total_tokens_val = 0
+
+                    if (response.choices and 
+                        isinstance(response.choices[0], dict) and 
+                        response.choices[0].get('message') and 
+                        isinstance(response.choices[0]['message'], dict)):
+                        output_summary_val = response.choices[0]['message'].get('content')
+                    
+                    if isinstance(response.usage, dict): # response.usage from ChatCompletionResponse is Dict[str, int]
+                        prompt_tokens_val = response.usage.get("prompt_tokens", 0)
+                        completion_tokens_val = response.usage.get("completion_tokens", 0)
+                        total_tokens_val = response.usage.get("total_tokens", 0)
+                    
+                    log_api_usage(
+                        api_key=api_key_for_logging,
+                        request_type="chat",
+                        model_name=response.model, # This is from ChatCompletionResponse.model
+                        prompt_tokens=prompt_tokens_val,
+                        completion_tokens=completion_tokens_val,
+                        total_tokens=total_tokens_val,
+                        input_summary=input_summary_for_logging,
+                        output_summary=output_summary_val
+                    )
                 return response
         elif request_data.model.startswith("gemini/"):
             if request_data.stream:
                 if api_key_for_logging: log_api_usage(api_key_for_logging, "chat_stream_attempt", request_data.model, input_summary=input_summary_for_logging)
                 return await stream_chat_completion_gemini(request_data, api_key_for_logging, input_summary_for_logging) # Pass logging info
-            else:
+            else: # Gemini non-stream
                 response = await get_chat_completion_gemini(request_data)
-                # Gemini non-stream currently doesn't return detailed token usage in the same way
-                if api_key_for_logging and response: log_api_usage(api_key_for_logging, "chat", response.model, input_summary=input_summary_for_logging, output_summary=response.choices[0].message.content if response.choices else None) # Token usage might be 0
+                if api_key_for_logging and response:
+                    output_summary_val = None
+                    prompt_tokens_val = 0 # Gemini non-stream usage is typically 0 from current get_chat_completion_gemini
+                    completion_tokens_val = 0
+                    total_tokens_val = 0
+
+                    if (response.choices and 
+                        isinstance(response.choices[0], dict) and 
+                        response.choices[0].get('message') and 
+                        isinstance(response.choices[0]['message'], dict)):
+                        output_summary_val = response.choices[0]['message'].get('content')
+                    
+                    # get_chat_completion_gemini currently returns usage with all zeros
+                    if isinstance(response.usage, dict):
+                        prompt_tokens_val = response.usage.get("prompt_tokens", 0)
+                        completion_tokens_val = response.usage.get("completion_tokens", 0)
+                        total_tokens_val = response.usage.get("total_tokens", 0)
+
+                    log_api_usage(
+                        api_key=api_key_for_logging,
+                        request_type="chat",
+                        model_name=response.model,
+                        prompt_tokens=prompt_tokens_val, # Will be 0 based on current get_chat_completion_gemini
+                        completion_tokens=completion_tokens_val, # Will be 0
+                        total_tokens=total_tokens_val, # Will be 0
+                        input_summary=input_summary_for_logging,
+                        output_summary=output_summary_val
+                    )
                 return response
         elif request_data.model.startswith("ollama/"):
             if request_data.stream:
@@ -1397,7 +1600,35 @@ async def create_chat_completion(request_data: ChatCompletionRequest, fastapi_re
             else:
                 response = await get_chat_completion_ollama(request_data)
                 # Ollama non-stream typically doesn't return token usage
-                if api_key_for_logging and response: log_api_usage(api_key_for_logging, "chat", response.model, input_summary=input_summary_for_logging, output_summary=response.choices[0].message.content if response.choices else None)
+                if api_key_for_logging and response:
+                    output_summary_val = None
+                    prompt_tokens_val = 0
+                    completion_tokens_val = 0
+                    total_tokens_val = 0
+
+                    if (response.choices and 
+                        isinstance(response.choices[0], dict) and 
+                        response.choices[0].get('message') and 
+                        isinstance(response.choices[0]['message'], dict)):
+                        output_summary_val = response.choices[0]['message'].get('content')
+                    
+                    if isinstance(response.usage, dict):
+                        prompt_tokens_val = response.usage.get("prompt_tokens", 0)
+                        completion_tokens_val = response.usage.get("completion_tokens", 0)
+                        total_tokens_val = response.usage.get("total_tokens", 0)
+                        if total_tokens_val == 0 and (prompt_tokens_val > 0 or completion_tokens_val > 0):
+                            total_tokens_val = prompt_tokens_val + completion_tokens_val
+                    
+                    log_api_usage(
+                        api_key=api_key_for_logging,
+                        request_type="chat",
+                        model_name=response.model,
+                        prompt_tokens=prompt_tokens_val,
+                        completion_tokens=completion_tokens_val,
+                        total_tokens=total_tokens_val,
+                        input_summary=input_summary_for_logging,
+                        output_summary=output_summary_val
+                    )
                 return response
         elif request_data.model.startswith("minmax/"):
             if request_data.stream:
@@ -1413,7 +1644,32 @@ async def create_chat_completion(request_data: ChatCompletionRequest, fastapi_re
                 return await stream_chat_completion_claude(request_data, api_key_for_logging, input_summary_for_logging)
             else:
                 response = await get_chat_completion_claude(request_data)
-                if api_key_for_logging and response: log_api_usage(api_key_for_logging, "chat", response.model, prompt_tokens=response.usage.get("prompt_tokens",0), completion_tokens=response.usage.get("completion_tokens",0), total_tokens=response.usage.get("total_tokens",0), input_summary=input_summary_for_logging, output_summary=response.choices[0].message.content if response.choices else None)
+                if api_key_for_logging and response: 
+                    output_summary_val = None
+                    prompt_tokens_val = 0
+                    completion_tokens_val = 0
+                    total_tokens_val = 0
+
+                    if (response.choices and 
+                        isinstance(response.choices[0], dict) and 
+                        response.choices[0].get('message') and 
+                        isinstance(response.choices[0]['message'], dict)):
+                        output_summary_val = response.choices[0]['message'].get('content') # Corrected access for dict
+                    else:
+                        # Fallback or error if structure is not as expected, though get_chat_completion_claude should ensure it.
+                        print(f"Warning: Claude non-stream response.choices structure unexpected: {response.choices}")
+                    
+                    if isinstance(response.usage, dict):
+                        prompt_tokens_val = response.usage.get("prompt_tokens",0)
+                        completion_tokens_val = response.usage.get("completion_tokens",0)
+                        total_tokens_val = response.usage.get("total_tokens",0)
+                    
+                    log_api_usage(api_key_for_logging, "chat", response.model, 
+                                  prompt_tokens=prompt_tokens_val, 
+                                  completion_tokens=completion_tokens_val, 
+                                  total_tokens=total_tokens_val, 
+                                  input_summary=input_summary_for_logging, 
+                                  output_summary=output_summary_val)
                 return response
         elif request_data.model.startswith("huggingface/"):
             if request_data.stream:
@@ -1494,90 +1750,100 @@ async def get_chat_completion_openai(request: ChatCompletionRequest) -> ChatComp
         raise HTTPException(status_code=500, detail=f"OpenAI API 錯誤: {str(e)}")
 
 async def get_chat_completion_gemini(request: ChatCompletionRequest) -> ChatCompletionResponse:
-    """處理 Google Gemini 的非串流聊天完成請求"""
+    """處理 Google Gemini 的非串流聊天完成請求 (使用字元長度估算 token, 相容舊版 SDK)"""
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="未設定 Google API 金鑰")
-    
-    try:
-        model_name = request.model.replace('gemini/', '')
-        if not model_name.startswith('models/'):
-            model_name = f"models/{model_name}"
-        
-        print(f"使用 Gemini 模型: {model_name}")
-        
-        system_instruction = None
-        user_and_assistant_messages = []
-        for msg in request.messages:
-            if msg.role == "system":
-                system_instruction = msg.content
-            else:
-                user_and_assistant_messages.append({"role": msg.role, "parts": [{"text": msg.content}]})
-        
-        from google.genai import types
-        generation_config = types.GenerateContentConfig(
-            temperature=request.temperature,
-            system_instruction=system_instruction if system_instruction else None 
-        )
-        if request.max_tokens:
-            generation_config.max_output_tokens = request.max_tokens
+    if client is None: # client 是 genai.Client() 的全域實例
+        raise HTTPException(status_code=500, detail="Google GenAI 客戶端未初始化。")
 
-        print(f"嘗試使用 API (非串流) - System Instruction: {system_instruction is not None}")
+    model_name_for_api = request.model.replace('gemini/', '')
+    if not model_name_for_api.startswith('models/'):
+        model_name_for_api = f"models/{model_name_for_api}"
+    
+    print(f"使用 Gemini 模型 (非串流): {model_name_for_api}")
+    
+    system_instruction_text = None
+    processed_messages = []
+    prompt_char_count = 0
+
+    for msg in request.messages:
+        prompt_char_count += len(msg.content)
+        if msg.role == "system":
+            if system_instruction_text is None:
+                system_instruction_text = msg.content
+            else:
+                processed_messages.append({"role": "user", "parts": [{"text": f"(額外系統指示): {msg.content}"}]})
+        else:
+            api_role = "user" if msg.role == "user" else "model"
+            processed_messages.append({"role": api_role, "parts": [{"text": msg.content}]})
+    
+    final_contents_for_api = []
+    if system_instruction_text:
+        final_contents_for_api.append({"role": "user", "parts": [{"text": f"System Instruction: {system_instruction_text}\\n\\nUser Question/Input Below:"}]})
+    final_contents_for_api.extend(processed_messages)
+
+    if not final_contents_for_api or not any(part["role"] == "user" for part in final_contents_for_api):
+        # 確保至少有一條 user message，這是 Gemini API 的普遍要求
+        final_contents_for_api.append({"role": "user", "parts": [{"text": "(無用戶輸入，繼續執行)"}]})
+        print("警告 (Gemini 非串流): 處理後 messages 列表為空或無 user message，已添加預設 user message。")
+
+    api_params = {
+        "model": model_name_for_api,
+        "contents": final_contents_for_api,
+    }
+    # 移除 temperature 和 max_output_tokens
+    # if request.temperature is not None:
+    #     api_params["temperature"] = request.temperature
+    # if request.max_tokens is not None:
+    #     api_params["max_output_tokens"] = request.max_tokens
+
+    print(f"Gemini 非串流 API 參數: {api_params}")
+
+    try:
         response = await asyncio.to_thread(
             client.models.generate_content,
-            model=model_name,
-            contents=user_and_assistant_messages,
-            config=generation_config
+            **api_params
         )
             
+        completion_text = getattr(response, 'text', '') # 安全地獲取 text 屬性
+        if not completion_text and response.candidates:
+            # 有些情況下 text 可能為空，但 candidates[0].content.parts[0].text 有內容
+            try:
+                completion_text = response.candidates[0].content.parts[0].text
+            except (IndexError, AttributeError):
+                completion_text = "[無法從 API 回應中提取內容]"
+
+        completion_char_count = len(completion_text)
+        total_char_count = prompt_char_count + completion_char_count
+            
         return ChatCompletionResponse(
-            id=f"gemini-{int(time.time())}",
+            id=f"gemini-ns-{int(time.time())}",
             created=int(time.time()),
-            model=request.model,  
+            model=request.model,
             choices=[{
-                "message": {
-                    "role": "assistant",
-                    "content": response.text
-                },
-                "finish_reason": "stop"
+                "message": {"role": "assistant", "content": completion_text},
+                "finish_reason": "stop" 
             }],
-            usage={
-                "prompt_tokens": 0, 
-                "completion_tokens": 0,
-                "total_tokens": 0
+            usage={ 
+                "prompt_tokens": prompt_char_count, 
+                "completion_tokens": completion_char_count,
+                "total_tokens": total_char_count
             }
         )
-
-    except types.generation_types.BlockedPromptException as e:
-        print(f"Gemini API 請求因安全設定被阻擋: {e}")
-        raise HTTPException(status_code=400, detail=f"請求內容可能違反安全政策而被阻擋: {str(e)}")
-    except types.generation_types.StopCandidateException as e:
-        print(f"Gemini API 因 StopCandidateException 停止生成: {e}")
-        # 這種情況下，可能仍然有部分內容生成，可以考慮是否返回
-        # 這裡我們選擇返回一個錯誤，但也可以構建一個包含已生成內容的回應
-        content_so_far = ""
-        if hasattr(e, '__cause__') and hasattr(e.__cause__, 'last_response') and e.__cause__.last_response:
-            if hasattr(e.__cause__.last_response, 'text'):
-                content_so_far = e.__cause__.last_response.text
-        raise HTTPException(status_code=500, detail=f"內容生成提前終止 (可能因安全或內容政策)。已生成部分: '{content_so_far or '無'}'")
-    except Exception as e:
+    except Exception as e: 
         error_message = str(e)
-        print(f"Gemini API 處理非串流請求時發生錯誤: {error_message}")
+        print(f"Gemini API 處理非串流請求時發生錯誤 ({model_name_for_api}): {error_message}")
         status_code = 500
-        detail = f"Gemini API 錯誤: {error_message}"
+        detail = f"Gemini API 錯誤 (非串流, 模型 {model_name_for_api}): {error_message}"
 
-        if "API key not valid" in error_message:
-            status_code = 401
-            detail = "Google API 金鑰無效。請檢查您的 API 金鑰設定。"
-        elif "Content with system role is not supported" in error_message:
-            status_code = 400
-            detail = "Gemini API 目前的呼叫方式不支援直接在訊息內容中包含 system role。"
-        elif "not found" in error_message.lower() or "PermissionDenied" in error_message or "404" in error_message:
-            status_code = 404
-            detail = f"Gemini 模型 '{model_name}' 未找到或無法存取。錯誤: {error_message}"
-        elif "INVALID_ARGUMENT" in error_message:
-            status_code = 400
-            detail = f"Gemini API 請求參數無效: {error_message}"
+        if "API key not valid" in error_message or "Unauthenticated" in error_message: status_code = 401; detail = "Google API 金鑰無效或未認證。"
+        elif "PermissionDenied" in error_message or "permission denied" in error_message: status_code = 403; detail = f"Google API 權限不足 ({model_name_for_api})。"
+        elif "not found" in error_message.lower() and ("model" in error_message.lower() or "resource" in error_message.lower()): status_code = 404; detail = f"Gemini 模型 '{model_name_for_api}' 未找到。"
+        elif "INVALID_ARGUMENT" in error_message or "Invalid request" in error_message or "got an unexpected keyword argument" in error_message : status_code = 400; detail = f"Gemini API 請求參數無效 ({model_name_for_api}): {error_message}"
+        elif "blocked" in error_message.lower() and ("prompt" in error_message.lower() or "safety" in error_message.lower()): status_code = 400; detail = f"請求內容可能因安全政策被阻擋 ({model_name_for_api})。"
+        elif "Deadline Exceeded" in error_message or "DEADLINE_EXCEEDED" in error_message: status_code = 504; detail = f"Gemini API 請求超時 ({model_name_for_api})。"
         
+        if "module 'google.genai.types' has no attribute" in error_message: detail += " (SDK 版本問題，建議更新： pip install --upgrade google-generativeai)"
         raise HTTPException(status_code=status_code, detail=detail)
 
 async def get_chat_completion_ollama(request: ChatCompletionRequest) -> ChatCompletionResponse:
@@ -1602,17 +1868,13 @@ async def get_chat_completion_ollama(request: ChatCompletionRequest) -> ChatComp
             } for msg in request.messages
         ],
         "stream": False,
-        "temperature": request.temperature
+        "temperature": request.temperature 
     }
     
     try:
         async with aiohttp.ClientSession() as session:
-            # 確定正確的 API 端點 URL
             api_url = OLLAMA_URL
-            
-            # 檢查 URL 是否已經包含 /api/chat 路徑
             if not (api_url.endswith('/api/chat') or api_url.endswith('/api/chat/')):
-                # 如果不包含，則構建完整的 API 路徑
                 if api_url.endswith('/'):
                     api_url = f"{api_url}api/chat" 
                 else:
@@ -1628,30 +1890,62 @@ async def get_chat_completion_ollama(request: ChatCompletionRequest) -> ChatComp
             ) as response:
                 if response.status != 200:
                     error_msg = await response.text()
+                    print(f"Ollama API Error ({response.status}): {error_msg}") 
                     raise HTTPException(
                         status_code=response.status,
                         detail=f"Ollama API 回應錯誤: {error_msg}"
                     )
                 
                 result = await response.json()
+                print(f"DEBUG: Ollama non-stream raw response: {result}")
+
+                response_content = ""
+                # 安全地獲取內容
+                if (isinstance(result, dict) and 
+                    "message" in result and
+                    isinstance(result.get("message"), dict) and
+                    "content" in result.get("message", {})):
+                    response_content = result["message"]["content"]
+                else:
+                    print(f"錯誤：Ollama 非串流回應格式非預期。收到的 result: {result}")
+                    response_content = "[Ollama 回應格式錯誤，無法提取內容]"
+                    # 您也可以選擇在這裡拋出一個 HTTPException，如果這是不可接受的錯誤
+                    # raise HTTPException(status_code=500, detail=f"Ollama 回應格式錯誤。原始回應: {str(result)[:200]}")
+
+                # 嘗試獲取 token 使用量
+                prompt_tokens = 0
+                completion_tokens = 0
+                actual_role = "assistant" # Default role
+
+                if isinstance(result, dict):
+                    prompt_tokens = result.get("prompt_eval_count", 0)
+                    completion_tokens = result.get("eval_count", 0)
+                    if isinstance(result.get("message"), dict):
+                        actual_role = result["message"].get("role", "assistant")
+
+                total_tokens = prompt_tokens + completion_tokens
+
                 return ChatCompletionResponse(
                     id=f"ollama-{int(time.time())}",
                     created=int(time.time()),
                     model=request.model,
                     choices=[{
                         "message": {
-                            "role": "assistant",
-                            "content": result["message"]["content"]
+                            "role": actual_role, 
+                            "content": response_content
                         },
-                        "finish_reason": "stop"
+                        "finish_reason": "stop" 
                     }],
                     usage={
-                        "prompt_tokens": 0,  # Ollama 不提供 token 計數
-                        "completion_tokens": 0,
-                        "total_tokens": 0
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens
                     }
                 )
     except Exception as e:
+        import traceback
+        print(f"Ollama API 錯誤 (get_chat_completion_ollama): {str(e)}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ollama API 錯誤: {str(e)}")
 
 async def get_chat_completion_minmax(request: ChatCompletionRequest) -> ChatCompletionResponse:
@@ -1791,7 +2085,7 @@ async def get_chat_completion_claude(request: ChatCompletionRequest) -> ChatComp
         # 使用 AsyncAnthropic Client
         client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         
-        print(f"Claude non-stream: Sending request to Anthropic API. System prompt: '{system_prompt if system_prompt else "None"}'. Messages: {user_messages}")
+        print(f"Claude non-stream: Sending request to Anthropic API. System prompt: '{system_prompt if system_prompt else 'None'}'. Messages: {user_messages}")
 
         # 构建请求参数
         api_params = {
