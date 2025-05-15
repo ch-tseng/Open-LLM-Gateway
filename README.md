@@ -82,16 +82,36 @@ api_keys_whitelist=
 - 請務必保護好您的 API 金鑰，不要將包含真實金鑰的 `.env` 檔案提交到公開的版本控制系統。
 
 ### 2.4 啟動伺服器
-在您的專案目錄中執行：
-```bash
-python main.py
-```
-伺服器預設會在 `http://localhost:8000` 啟動。
+有以下幾種方式可以啟動伺服器：
 
-或者，推薦使用 `uvicorn` 進行更專業的部署：
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
-```
+1.  **直接執行 Python 腳本** (適合快速測試)：
+    ```bash
+    python main.py
+    ```
+    伺服器預設會在 `http://localhost:8000` 啟動。
+
+2.  **使用 Uvicorn** (推薦用於更專業的部署或開發時啟用重載)：
+    ```bash
+    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    ```
+    使用 `--reload` 參數可以在程式碼變更時自動重啟伺服器。
+
+3.  **使用提供的啟動腳本** (推薦，自動處理虛擬環境和依賴安裝)：
+
+    *   **Linux / macOS**:
+        ```bash
+        # 首次執行前，可能需要給予腳本執行權限
+        chmod +x start.sh
+        ./start.sh
+        ```
+
+    *   **Windows**:
+        直接雙擊 `run.bat` 檔案，或在命令提示字元中執行：
+        ```batch
+        run.bat
+        ```
+
+    這些腳本會嘗試啟用專案根目錄下的 `.venv` 虛擬環境，安裝 `requirements.txt` 中的依賴，然後使用 Uvicorn 啟動伺服器。
 
 ## 3. 使用說明
 
