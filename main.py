@@ -38,6 +38,116 @@ load_dotenv(override=True) # Moved here, to be before getenv calls for ENABLE_CH
 ENABLE_CHECK_APIKEY = os.getenv("ENABLE_CHECK_APIKEY", "False").lower() == "true"
 api_key_dependency = Depends(verify_api_key) if ENABLE_CHECK_APIKEY else Depends(always_allow)
 
+# --- 從請求提取 API 金鑰的輔助函數 ---
+async def get_api_key_from_request(request: Request) -> Optional[str]:
+    authorization: Optional[str] = request.headers.get("Authorization")
+    if authorization and authorization.startswith("Bearer "):
+        return authorization.replace("Bearer ", "").strip()
+    return None
+
+# --- 日誌記錄相關 (從先前版本恢復) ---
+HISTORY_APIKEY_DIR = os.getenv("HISTORY_APIKEY_DIR", os.path.join(os.path.dirname(__file__), "history_apikey"))
+LOG_FILE_HANDLERS = {} # To store open file handlers
+
+def get_log_file_path(api_key: str) -> Optional[str]:
+    if not api_key:
+        return None
+    try:
+        key_log_dir = os.path.join(HISTORY_APIKEY_DIR, api_key)
+        os.makedirs(key_log_dir, exist_ok=True)
+        date_str = datetime.datetime.now().strftime("%Y%m%d")
+        return os.path.join(key_log_dir, f"{date_str}.txt")
+    except Exception as e:
+        print(f"Error creating log directory for API key {api_key}: {e}")
+        return None
+
+def get_file_handler(file_path: str):
+    if file_path not in LOG_FILE_HANDLERS:
+        try:
+            LOG_FILE_HANDLERS[file_path] = open(file_path, "a", encoding="utf-8")
+        except Exception as e:
+            print(f"Error opening log file {file_path}: {e}")
+            return None
+    return LOG_FILE_HANDLERS[file_path]
+
+def close_all_log_files():
+    print("Closing all open log files...")
+    for handler in LOG_FILE_HANDLERS.values():
+        try:
+            handler.close()
+        except Exception as e:
+            print(f"Error closing a log file: {e}")
+    LOG_FILE_HANDLERS.clear()
+
+atexit.register(close_all_log_files) # Register cleanup function
+
+def log_api_usage(
+    api_key: str,
+    request_type: str, # "embedding" or "chat"
+    model_name: str,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+    input_summary: Optional[str] = None,
+    output_summary: Optional[str] = None,
+    status_code: int = 200,
+    error_message: Optional[str] = None
+):
+    if not api_key or not ENABLE_CHECK_APIKEY: # Only log if API key check is enabled and key is present
+        # If api_key is a placeholder like "logging_disabled_or_no_key_needed", also skip logging.
+        if api_key == "logging_disabled_or_no_key_needed":
+             return
+        if not ENABLE_CHECK_APIKEY: # If check is disabled, don't log based on key
+             print(f"DEBUG: API Key check disabled, skipping logging for request type {request_type}, model {model_name}")
+             return
+        # If check is enabled but no key provided for a request that should have one,
+        # it might be caught by verify_api_key. If it reaches here with no api_key,
+        # it means it passed verification (e.g. verify_api_key was not applied or always_allow was used).
+        # In such a case, if ENABLE_CHECK_APIKEY is true, we might still not want to log without a key.
+        # However, the original logic was `if not api_key or not ENABLE_CHECK_APIKEY: return`.
+        # Let's stick to that primarily.
+        if not api_key: # Ensure this path is also skipped if no API key even if check is enabled.
+            print(f"DEBUG: No API key provided, skipping logging for request type {request_type}, model {model_name}")
+            return
+
+    log_file_path = get_log_file_path(api_key)
+    if not log_file_path:
+        return
+
+    handler = get_file_handler(log_file_path)
+    if not handler:
+        return
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry_parts = [
+        f"[{timestamp}]",
+        f"Type: {request_type}",
+        f"Model: {model_name}",
+        f"APIKeySuffix: ...{api_key[-4:] if api_key and len(api_key) >= 4 else 'N/A'}",
+        f"PromptTokens: {prompt_tokens}",
+        f"CompletionTokens: {completion_tokens}",
+        f"TotalTokens: {total_tokens}",
+        f"StatusCode: {status_code}",
+    ]
+    if input_summary:
+        log_entry_parts.append(f"Input: {input_summary[:100].replace(chr(10), ' ')}")
+    if output_summary:
+        log_entry_parts.append(f"Output: {output_summary[:100].replace(chr(10), ' ')}")
+    if error_message:
+        log_entry_parts.append(f"Error: {error_message[:100].replace(chr(10), ' ')}")
+
+    log_entry = ", ".join(log_entry_parts) + "\n"
+
+    try:
+        abs_log_path = os.path.abspath(log_file_path)
+        print(f"DEBUG: Attempting to write to log file (Absolute Path): {abs_log_path}")
+        print(f"DEBUG: Log entry content (first 100 chars): {log_entry[:100]}")
+        handler.write(log_entry)
+        handler.flush()
+        print(f"DEBUG: Successfully wrote to log file (Absolute Path): {abs_log_path}")
+    except Exception as e:
+        print(f"Error writing to log file {log_file_path}: {e}")
+
 # --- Pydantic 模型定義 ---
 
 class Usage(BaseModel):
