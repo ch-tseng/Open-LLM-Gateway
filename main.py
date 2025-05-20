@@ -541,12 +541,16 @@ async def create_embedding(request_data: EmbeddingRequest, fastapi_request: Requ
                         print(f"Ollama API 回應格式非預期 for input '{text_input[:50]}...': {ollama_response}")
                         raise HTTPException(status_code=500, detail=f"無法從 Ollama API 回應中解析 '{ollama_model_name}' 的 embedding。")
                     
-                    response_data.append(EmbeddingData(embedding=ollama_response['embedding'], index=i))
+                    # 為每個 embedding data 計算獨立的 usage
+                    current_input_tokens = count_tokens([text_input])
+                    individual_usage = Usage(prompt_tokens=current_input_tokens, total_tokens=current_input_tokens, completion_tokens=0)
+                    response_data.append(EmbeddingData(embedding=ollama_response['embedding'], index=i, usage=individual_usage))
 
-                tokens = count_tokens(input_texts)
-                usage = Usage(prompt_tokens=tokens, total_tokens=tokens)
+                # 整體 usage 計算 (用於 EmbeddingResponse)
+                total_prompt_tokens = count_tokens(input_texts)
+                usage = Usage(prompt_tokens=total_prompt_tokens, total_tokens=total_prompt_tokens, completion_tokens=0) # 確保 completion_tokens 也被設定
                 actual_model_name = requested_model
-                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", actual_model_name, prompt_tokens=tokens, total_tokens=tokens, input_summary=input_summary_for_logging)
+                if api_key_for_logging: log_api_usage(api_key_for_logging, "embedding", actual_model_name, prompt_tokens=usage.prompt_tokens, total_tokens=usage.total_tokens, input_summary=input_summary_for_logging)
 
             except OllamaResponseError as e:
                 detail = f"Ollama API 錯誤 ({ollama_model_name}): {str(e)}"
@@ -1635,10 +1639,12 @@ async def create_chat_completion(request_data: ChatCompletionRequest, fastapi_re
 # --- 啟動伺服器 (用於本地測試) ---
 if __name__ == "__main__":
     import uvicorn
+    print("第一次安裝設定並啟動時，會等待比較久。請耐心等待直到 Application startup complete. 出現後，即可開始使用。")
     # 允許從任何來源訪問 (用於開發)
     # 在生產環境中，您可能需要更嚴格的 CORS 設定
     # 為了穩定性，尤其是在Windows上且有複雜依賴（如TensorFlow）時，建議 reload=False
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
+    
 
 # 非串流處理函數
 async def get_chat_completion_openai(request: ChatCompletionRequest) -> ChatCompletionResponse:

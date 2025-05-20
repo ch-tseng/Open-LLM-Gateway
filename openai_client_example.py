@@ -43,15 +43,15 @@ OPENLLM_GATEWAY_API_KEY = "DEFAULT-20250508-kbxk8c"  # <--- 請務必替換成�
 
 # 範例中使用的聊天模型名稱
 # 請確保此模型已在您的 Gateway 中設定並可用。
-# CHAT_MODEL_NAME = "ollama/qwen3:8b"
+CHAT_MODEL_NAME = "ollama/qwen3:8b"
 # CHAT_MODEL_NAME = "openai/gpt-4.1"
 # CHAT_MODEL_NAME = "gemini/gemini-2.0-flash"
-CHAT_MODEL_NAME = "claude/claude-3-7-sonnet-latest"
+# CHAT_MODEL_NAME = "claude/claude-3-7-sonnet-latest"
 
 # 範例中使用的文本嵌入模型名稱
 # 請確保此模型已在您的 Gateway 中設定並可用。
-# EMBEDDING_MODEL_NAME = "ollama/bge-m3:latest"
-EMBEDDING_MODEL_NAME = "openai/text-embedding-3-small"
+EMBEDDING_MODEL_NAME = "ollama/bge-m3:latest"
+# EMBEDDING_MODEL_NAME = "openai/text-embedding-3-small"
 # EMBEDDING_MODEL_NAME = "gemini/embedding-001"
 
 # --- 初始化 OpenAI 客戶端 ---
