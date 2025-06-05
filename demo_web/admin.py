@@ -55,6 +55,26 @@ def validate_apikey_format(apikey):
     pattern = r"^[A-Z0-9]{2,8}-\d{8}-[a-z0-9]{6}$"
     return bool(re.match(pattern, apikey))
 
+# 簡化版本的API金鑰統計
+def get_apikey_stats_simple():
+    """簡化版本的API金鑰統計，只獲取基本信息"""
+    api_keys_data = load_api_keys()
+    stats = []
+    
+    for apikey, info in api_keys_data.items():
+        stats.append({
+            "api_key": apikey,
+            "created_at": info.get("created_at", "未知"),
+            "last_access": "未知",
+            "total_requests": 0,
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "description": info.get("description", ""),
+            "is_disabled": apikey.endswith(DISABLED_MARK)
+        })
+    
+    return stats
+
 # 獲取API金鑰使用統計
 def get_apikey_stats():
     """從history_apikey目錄獲取所有API金鑰的使用統計"""
@@ -63,10 +83,17 @@ def get_apikey_stats():
     
     # 遍歷history_apikey目錄中的所有API金鑰目錄
     if not os.path.exists(HISTORY_APIKEY_DIR):
-        print(f"Warning: API key history directory not found: {HISTORY_APIKEY_DIR}")
+        st.warning(f"API key history directory not found: {HISTORY_APIKEY_DIR}")
         return stats
         
-    for apikey_dir_name in os.listdir(HISTORY_APIKEY_DIR):
+    try:
+        dir_contents = os.listdir(HISTORY_APIKEY_DIR)
+        # st.info(f"Found {len(dir_contents)} items in {HISTORY_APIKEY_DIR}")
+    except Exception as e:
+        st.error(f"Error accessing directory {HISTORY_APIKEY_DIR}: {e}")
+        return stats
+        
+    for apikey_dir_name in dir_contents:
         apikey_path = os.path.join(HISTORY_APIKEY_DIR, apikey_dir_name)
         
         # 跳過非目錄項或API金鑰數據文件
@@ -84,7 +111,7 @@ def get_apikey_stats():
 
         # 檢查是否為有效的API金鑰格式 (針對 actual_apikey)
         if not validate_apikey_format(actual_apikey):
-            print(f"Skipping directory with invalid API key format: {actual_apikey}")
+            # st.warning(f"Skipping directory with invalid API key format: {actual_apikey}")
             continue
             
         total_requests = 0
@@ -93,7 +120,14 @@ def get_apikey_stats():
         last_access_dt = None # Use datetime object for comparison
         
         # 遍歷API金鑰目錄中的所有日誌文件 (e.g., YYYYMMDD.txt)
-        for log_file_name in os.listdir(apikey_path):
+        try:
+            log_files = os.listdir(apikey_path)
+            # st.info(f"Processing API key {actual_apikey} with {len(log_files)} log files")
+        except Exception as e:
+            st.error(f"Error accessing API key directory {apikey_path}: {e}")
+            continue
+            
+        for log_file_name in log_files:
             if not log_file_name.endswith('.txt'): # Assuming logs are .txt files
                 continue
                 
@@ -101,40 +135,34 @@ def get_apikey_stats():
             
             try:
                 with open(log_file_path, 'r', encoding='utf-8') as f:
+                    line_count = 0
                     for line_number, line in enumerate(f):
                         line = line.strip()
                         if not line:
                             continue
 
                         total_requests += 1 # Count each non-empty line as a request attempt
+                        line_count += 1
+                        
+                        # 限制每個文件最多處理1000行，避免處理時間過長
+                        if line_count > 1000:
+                            # st.warning(f"Log file {log_file_name} has too many lines, processing first 1000 only")
+                            break
 
-                        # Regex to capture relevant parts from the new log format
-                        # Example: [2024-05-15 10:00:00] Type: chat, Model: openai/gpt-3.5, APIKeySuffix: ...key, PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30, StatusCode: 200
-                        match = re.search(
-                            r"""^\[(.*?)\]                        # Timestamp (e.g., 2024-05-15 10:00:00)
-                            .*?Type:\s*(embedding|chat|chat_stream_attempt|chat_stream_completed|chat_error)  # Type
-                            .*?Model:\s*(.*?)                      # Model Name
-                            .*?APIKeySuffix:\s*(.*?)               # API Key Suffix
-                            .*?PromptTokens:\s*(\d+)               # Prompt Tokens
-                            .*?CompletionTokens:\s*(\d+)           # Completion Tokens
-                            .*?TotalTokens:\s*(\d+)                 # Total Tokens
-                            .*?StatusCode:\s*(\d+)                 # Status Code
-                            (?:.*?Input:\s*(.*?))?                  # Optional Input Summary
-                            (?:.*?Output:\s*(.*?))?                 # Optional Output Summary
-                            (?:.*?Error:\s*(.*?))?$                 # Optional Error Message
-                            """, 
-                            line, 
-                            re.VERBOSE
-                        )
-
-                        if match:
-                            timestamp_str = match.group(1)
-                            # request_type = match.group(2) # Not used for current stats, but available
-                            # model_name_logged = match.group(3) # Not used for current stats
-                            prompt_tokens_val = int(match.group(5))
-                            completion_tokens_val = int(match.group(6))
-                            # total_tokens_val = int(match.group(7)) # Can be used or re-calculated
-                            status_code_val = int(match.group(8))
+                        # 簡化的正則表達式匹配，避免性能問題
+                        # 嘗試匹配時間戳
+                        timestamp_match = re.search(r'^\[(.*?)\]', line)
+                        
+                        # 嘗試匹配 token 數據
+                        prompt_tokens_match = re.search(r'PromptTokens:\s*(\d+)', line)
+                        completion_tokens_match = re.search(r'CompletionTokens:\s*(\d+)', line)
+                        status_code_match = re.search(r'StatusCode:\s*(\d+)', line)
+                        
+                        if timestamp_match and prompt_tokens_match and completion_tokens_match and status_code_match:
+                            timestamp_str = timestamp_match.group(1)
+                            prompt_tokens_val = int(prompt_tokens_match.group(1))
+                            completion_tokens_val = int(completion_tokens_match.group(1))
+                            status_code_val = int(status_code_match.group(1))
 
                             # Only add to token counts if request was successful (e.g., StatusCode 200)
                             # You might want to adjust this logic based on how errors are logged or if you want to count tokens for failed requests too.
@@ -147,7 +175,7 @@ def get_apikey_stats():
                                 if last_access_dt is None or current_access_dt > last_access_dt:
                                     last_access_dt = current_access_dt
                             except ValueError:
-                                print(f"Warning: Could not parse timestamp '{timestamp_str}' in {log_file_path}, line {line_number + 1}")
+                                pass  # Ignore timestamp parsing errors
                         else:
                             # Fallback for old log format or lines that don't match
                             # This part tries to salvage data if old logs exist or for simpler log lines.
@@ -167,9 +195,9 @@ def get_apikey_stats():
                                         last_access_dt = current_access_dt
                                 except ValueError:
                                     pass # Ignore if timestamp in old format is also unparseable
-                            # print(f"Warning: Could not parse log line in {log_file_path}, line {line_number + 1}: {line[:100]}...")
+                            # st.warning(f"Could not parse log line in {log_file_path}, line {line_number + 1}: {line[:100]}...")
             except Exception as e:
-                print(f"Error reading or processing log file {log_file_path}: {e}")
+                st.error(f"Error reading or processing log file {log_file_path}: {e}")
                 continue # Skip to next log file if one is broken
         
         # 獲取創建時間 (從API金鑰的日期部分，或從 api_keys_data)
@@ -331,8 +359,26 @@ def main():
     with tab1:
         st.header("API金鑰列表及使用統計")
         
+        # 添加模式選擇
+        use_simple_mode = st.checkbox("使用簡化模式 (如果完整統計載入失敗)", value=False)
+        
         # 獲取API金鑰統計數據
-        apikey_stats = get_apikey_stats()
+        with st.spinner("正在載入API金鑰統計數據..."):
+            try:
+                if use_simple_mode:
+                    apikey_stats = get_apikey_stats_simple()
+                    st.info("正在使用簡化模式，某些統計數據可能不準確")
+                else:
+                    apikey_stats = get_apikey_stats()
+            except Exception as e:
+                st.error(f"載入API金鑰統計數據時發生錯誤: {e}")
+                st.info("正在嘗試簡化模式...")
+                try:
+                    apikey_stats = get_apikey_stats_simple()
+                    st.success("已切換到簡化模式")
+                except Exception as e2:
+                    st.error(f"簡化模式也失敗了: {e2}")
+                    apikey_stats = []
         
         if not apikey_stats:
             st.info("尚未找到任何API金鑰記錄。請先產生新的API金鑰。")
